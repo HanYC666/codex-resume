@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Monitor active Codex daemon threads and retry stopped failed turns once."""
+"""Monitor active Codex daemon threads and recover failed turns with per-thread retry backoff."""
 import argparse, json, os, re, socket, sys, time
 
 VERBOSE = False
@@ -35,7 +35,7 @@ class RPC:
             self.ws = websocket.create_connection(path if is_url else 'ws://localhost/', socket=raw,
                                                   timeout=timeout, enable_multithread=True, suppress_origin=True)
             log('WebSocket handshake accepted')
-            self.call('initialize', {'clientInfo': {'name':'codex-recovery','title':'Codex recovery','version':'0.2'}, 'capabilities': {'experimentalApi':True,'requestAttestation':False}})
+            self.call('initialize', {'clientInfo': {'name':'codex-recovery','title':'Codex recovery','version':'0.3'}, 'capabilities': {'experimentalApi':True,'requestAttestation':False}})
             self.send({'method':'initialized','params':{}})
             log('Initialization complete')
         except Exception as e:
@@ -91,7 +91,81 @@ def blocked_error(error):
     if not error: return True
     if isinstance(error, dict) and error.get('misalignment'): return True
     s = json.dumps(error).lower()
-    return any(x in s for x in ('cybersecurity','safety check','approval required','permission denied','usage limit','usage_limit','quota exceeded','budget limit'))
+    return any(x in s for x in ('cybersecurity','safety check','approval required','permission denied'))
+
+BACKOFF_SECONDS = 15 * 60
+
+def error_identity(error):
+    """Ignore per-request IDs while keeping distinct failure categories."""
+    message = str(error.get('message', '') if isinstance(error, dict) else error).lower()
+    if 'model_not_found' in message:
+        model = re.search(r"['\"]([a-z0-9._-]+)['\"] model", message)
+        return 'model_not_found:' + (model.group(1) if model else 'unknown')
+    if 'no account is available for the upstream' in message:
+        return 'compaction_upstream_unavailable'
+    if any(x in message for x in ('usage limit', 'usage_limit', 'quota', 'rate limit')):
+        return 'quota_or_rate_limit'
+    status = re.search(r'(?:unexpected status|last status:)\s*(\d{3})', message)
+    if status: return 'http_' + status.group(1)
+    info = error.get('codexErrorInfo') if isinstance(error, dict) else None
+    if info and info != 'other': return json.dumps(info, sort_keys=True)
+    for x in ('stream disconnected', 'timed out', 'connection reset', 'connection closed'):
+        if x in message: return x
+    message = re.sub(r'(?:request id|request_id|cf-ray)[=: ]+\S+', '', message)
+    return re.sub(r'\s+', ' ', message).strip()
+
+class RecoveryState:
+    def __init__(self):
+        self.seen_failures = set()
+        self.attempted_turns = set()
+        self.consecutive = 0
+        self.same_error = 0
+        self.last_error = None
+        self.last_failed_id = None
+        self.last_attempt = None
+        self.slow = False
+        self.next_retry = None
+
+    def completed_since_failure(self, turns):
+        if not self.last_failed_id: return False
+        ids = [t.get('id') for t in turns]
+        if self.last_failed_id in ids:
+            newer = turns[:ids.index(self.last_failed_id)]
+        elif turns and turns[0].get('status') == 'completed':
+            newer = turns[:1]
+        else: return False
+        return any(t.get('status') == 'completed' for t in newer)
+
+    def reset(self):
+        # Keep deduplication history, but a successful turn breaks the error streak.
+        self.consecutive = self.same_error = 0
+        self.last_error = self.last_failed_id = None
+        self.slow = False
+        self.next_retry = None
+
+    def failure(self, turn, now):
+        tid = turn['id']
+        if tid in self.seen_failures: return False
+        self.seen_failures.add(tid)
+        self.consecutive += 1
+        identity = error_identity(turn['error'])
+        self.same_error = self.same_error + 1 if identity == self.last_error else 1
+        self.last_error = identity
+        self.last_failed_id = tid
+        if not self.slow and (self.same_error >= 2 or self.consecutive >= 3):
+            self.slow = True
+            self.next_retry = (self.last_attempt if self.last_attempt is not None else now) + BACKOFF_SECONDS
+            return True
+        return False
+
+    def ready(self, turn_id, now):
+        if self.slow: return now >= self.next_retry
+        return turn_id not in self.attempted_turns
+
+    def record(self, turn_id, now):
+        self.attempted_turns.add(turn_id)
+        self.last_attempt = now
+        if self.slow: self.next_retry = now + BACKOFF_SECONDS
 
 def pages(rpc, method, params):
     cursor=None; seen=set()
@@ -103,11 +177,11 @@ def pages(rpc, method, params):
         seen.add(cursor)
 
 def run(rpc, dry_run, interval):
-    tracked={}; attempted=set()
+    tracked={}; states={}; history=[] # All recovery history lives only in this process.
     print('Monitoring active root threads from the shared Codex daemon. Ctrl-C to stop.', flush=True)
     while True:
         start=time.monotonic()
-        log('Beginning poll; tracked=%d attempted_turns=%d' % (len(tracked), len(attempted)))
+        log('Beginning poll; tracked=%d recovery_records=%d' % (len(tracked), len(history)))
         try:
             ids=list(pages(rpc,'thread/loaded/list',{'limit':100}))
             log('Loaded threads (%d): %s' % (len(ids), ', '.join(ids) or 'none'))
@@ -129,9 +203,13 @@ def run(rpc, dry_run, interval):
                             log('Thread %s baseline: turn=%s status=%s' % (tid, *tracked[tid]))
                     if tid not in tracked:
                         log('Thread %s: skipped, not observed working' % tid); continue
-                    if kind not in ('idle','systemError'):
+                    state=states.setdefault(tid, RecoveryState())
+                    turns=rpc.call('thread/turns/list',{'threadId':tid,'limit':10,'sortDirection':'desc'}).get('data',[])
+                    if state.completed_since_failure(turns):
+                        state.reset()
+                        print('Thread %s: successful turn observed; normal retry rate restored' % title,flush=True)
+                    if kind not in ('idle','systemError') or flags:
                         log('Thread %s: skipped, still active or waiting for input' % tid); continue
-                    turns=rpc.call('thread/turns/list',{'threadId':tid,'limit':1,'sortDirection':'desc'}).get('data',[])
                     if not turns:
                         log('Thread %s: no turn returned' % tid); continue
                     turn=turns[0]; turn_id=turn.get('id'); key=(tid,turn_id)
@@ -143,10 +221,16 @@ def run(rpc, dry_run, interval):
                         log('Thread %s: skipped, latest turn not failed' % tid); continue
                     if not turn_id:
                         log('Thread %s: skipped, missing turn ID' % tid); continue
-                    if key in attempted:
-                        log('Thread %s: skipped, already attempted this turn' % tid); continue
                     if blocked_error(turn.get('error')):
                         log('Thread %s: skipped, missing error or excluded error category' % tid); continue
+                    now=time.monotonic()
+                    if state.failure(turn, now):
+                        print('Thread %s: entering 15-minute retry mode (%d consecutive errors; %d matching)' % (title,state.consecutive,state.same_error),flush=True)
+                    if not state.ready(turn_id, now):
+                        if state.slow:
+                            log('Thread %s: backoff; next retry in %.1fs' % (tid,max(0,state.next_retry-now)))
+                        else: log('Thread %s: skipped, already attempted this turn' % tid)
+                        continue
                     # This is the latest failed turn of a thread observed working in this run.
                     try: goal=rpc.call('thread/goal/get',{'threadId':tid}).get('goal')
                     except RPCError as e:
@@ -155,19 +239,31 @@ def run(rpc, dry_run, interval):
                     log('Thread %s goal status=%s' % (tid, goal.get('status') if goal else 'none'))
                     action='resume goal' if goal and goal.get('status')!='complete' else 'Continue'
                     print(('DRY RUN: ' if dry_run else '')+action+' for '+str(title)+' ('+tid+', turn '+turn_id+')',flush=True)
-                    attempted.add(key) # never duplicate on ambiguous timeout
-                    log('Thread %s: recorded attempt for turn %s' % (tid, turn_id))
                     if not dry_run:
                         # Recheck just before mutation; leave user-input and active states alone.
                         fresh=rpc.call('thread/read',{'threadId':tid,'includeTurns':False})['thread']
                         if fresh.get('status',{}).get('type') not in ('idle','systemError'): print('Skipped: status changed',flush=True); continue
                         latest=rpc.call('thread/turns/list',{'threadId':tid,'limit':1,'sortDirection':'desc'}).get('data',[])
                         if not latest or latest[0].get('id')!=turn_id or latest[0].get('status')!='failed': print('Skipped: turn changed',flush=True); continue
+                    # Record only after the preflight checks. Failures with ambiguous
+                    # submission outcomes are retained as attempts, never sent twice rapidly.
+                    state.record(turn_id, time.monotonic())
+                    entry={'time':time.time(),'thread_id':tid,'turn_id':turn_id,
+                           'action':action,'error':state.last_error,'slow':state.slow,
+                           'outcome':'dry-run' if dry_run else 'pending'}
+                    history.append(entry)
+                    log('Recovery record #%d: %s' % (len(history), entry))
+                    if not dry_run:
                         log('Thread %s: recheck passed; submitting %s' % (tid, action))
-                        if goal and goal.get('status')!='complete':
-                            rpc.call('thread/goal/set',{'threadId':tid,'status':'active','origin':'user'})
-                        else:
-                            rpc.call('turn/start',{'threadId':tid,'input':[{'type':'text','text':'Continue','text_elements':[]}]})
+                        try:
+                            if goal and goal.get('status')!='complete':
+                                rpc.call('thread/goal/set',{'threadId':tid,'status':'active','origin':'user'})
+                            else:
+                                rpc.call('turn/start',{'threadId':tid,'input':[{'type':'text','text':'Continue','text_elements':[]}]})
+                            entry['outcome']='accepted'
+                        except RPCError:
+                            entry['outcome']='error-or-unknown'
+                            raise
                         log('Thread %s: recovery request accepted' % tid)
                 except RPCError as e: print('Thread',tid,'skipped:',e,flush=True)
             for missing in set(tracked)-set(ids): log('Thread %s: no longer loaded; removing from tracking' % missing)
@@ -176,6 +272,8 @@ def run(rpc, dry_run, interval):
             print('Polling failed:',e,flush=True)
             if isinstance(rpc,RPC) and rpc.ws is None: raise
         delay=max(0.1,interval-(time.monotonic()-start))
+        deadlines=[st.next_retry for st in states.values() if st.slow and st.next_retry is not None and st.next_retry > time.monotonic()]
+        if deadlines: delay=min(delay,max(0.1,min(deadlines)-time.monotonic()))
         log('Poll complete; sleeping %.2fs' % delay)
         time.sleep(delay)
 
