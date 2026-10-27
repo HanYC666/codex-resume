@@ -1,0 +1,2 @@
+# Runtime dependency; Python 3.10+ is required by this tested release.
+websocket-client==1.9.2
