@@ -128,7 +128,7 @@ class MonitorTests(unittest.TestCase):
         sink=io.StringIO()
         dashboard.console=Console(file=sink,width=80,height=24,color_system=None)
         frames=[]
-        for page in range(4):
+        for page in range(8):
             with patch.object(monitor.time,'monotonic',return_value=100+page*8):
                 dashboard.console.print(dashboard.render())
             frame=sink.getvalue(); sink.seek(0); sink.truncate()

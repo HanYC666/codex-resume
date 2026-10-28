@@ -118,6 +118,23 @@ Repeated polls of the same failed turn do not count as new errors. Error matchin
 
 The watcher does not approve permission requests or security notices. Safety/permission failures remain excluded. Persistent outages can still produce repeated API requests, especially before slow mode begins.
 
+### Provider-specific model fallback
+
+For the specific error `Invalid input type 'configuration_update'` / `invalid_input_type`, the watcher applies this default policy:
+
+| Current model | Fallback model | Reasoning |
+| --- | --- | --- |
+| `gpt-6.1-sol` | `gpt-6-sol` | Preserve the same level |
+| `gpt-6-astra` | `gpt-6-sol` | Preserve the same level |
+
+This is a user-specified provider workaround. The error text describes an unsupported input type; it does not, by itself, prove a model-specific usage limit. Other invalid input types and general 429/quota errors do not trigger model switching.
+
+The watcher updates only the affected thread through `thread/settings/update`, then reads back the model and reasoning setting before issuing its normal Continue or Goal resume recovery. It preserves the explicit reasoning level; if the level is unset, it tries to resolve the source model's default from the model catalog. If it cannot preserve or confirm the settings, or no fallback is configured, it stops automatic recovery for that thread rather than guessing a lower level or repeatedly changing models. A confirmed fallback gets one immediate recovery even if the thread was already in 15-minute mode.
+
+If a **new failed turn** reports the same configuration-update error after the confirmed switch, automatic recovery is disabled for that thread for the rest of the watcher run. An incomplete Goal is paused; a failed prompt thread remains stopped. There are no 15-minute retries for this stop condition. Other threads continue being monitored. The stop and fallback history survive a completed turn during the run, so an intervening success does not permit an endless fallback/retry cycle. A manual resume is left alone if the thread is already working when the stop check runs.
+
+The panel shows `Stopped` and disables its retry countdown. Events explain why the thread stopped. This does not delete or archive the conversation, and users can still manage it manually in Codex. Dry-run mode logs the proposed switch/recovery without changing settings, resuming or pausing a Goal, or claiming the model actually changed.
+
 ### Recovery history
 
 Each recovery records its time, thread/turn ID, action, normalized error category, retry mode and outcome **in memory only**. Nothing is saved to a history file. History and counters are discarded when the program exits. With `-v`, recovery records and backoff countdowns are printed to the terminal.
@@ -130,16 +147,18 @@ The panel shows:
 
 - Active, paused/waiting, ready and tracked thread counts (tracked root threads only).
 - Distinct errors and total recovery attempts, successes and failures.
-- Each thread's state, attempts, successful and failed recoveries, pending outcomes, retry mode and next-retry countdown.
+- Each thread's state, configured model, reasoning level, Prompt/Goal mode, recovery counts, retry mode and next-retry countdown.
 - Poll interval, next poll, age of the last completed poll, uptime and current RPC activity.
 
 “Immediate” means an eligible new failed turn can be recovered as soon as polling detects it; “15m” means the thread is in slow retry mode. The poll interval remains five seconds by default. “Success” requires an observed completed recovery turn; accepting a command or becoming active does not count. Counts combine Continue and Goal resume for each thread; the exit summary separates them. Dry-run plans are labelled separately and do not inflate real attempt or success counters.
 
 The panel uses cyan for working threads, green for ready threads and completed recoveries, yellow for backoff or input requests, and red for errors or attention needed. State labels remain visible with colour disabled. `Done` counts completed recovery turns, not completed tasks. `Paused` includes threads waiting for input, in backoff, stopped on an error, or otherwise not working or ready.
 
+Each thread also shows its configured model and reasoning level under its name, and `Prompt`, `Goal active`, `Goal paused`, `Goal blocked`, or a Goal-limit state under its status. These are the daemon's current configured settings, not independent per-token execution telemetry. An unset reasoning level is labelled `default`; unavailable model/mode values are marked `?`. Settings and Goal state refresh on each poll, including after manual changes.
+
 Every row includes a short unique ID suffix, so identical or shortened titles remain distinguishable. Long names, including Unicode names, are shortened by terminal-cell width. Threads needing attention appear first, followed by errors, backoff, working and ready/paused threads. This is display ordering only; it does not change recovery decisions or polling.
 
-Logs appear above the panel, including with `-v`. Wide terminals show separate counters; medium terminals combine them under `SENT/OK/FAIL`. Below 76 columns, thread cards replace the table. Very short terminals use a compact rotating view. When threads do not all fit, pages rotate every eight seconds with a page indicator; totals include every tracked thread, including those on other pages. Dry-run rows display planned operations instead of real submissions, labelled `PLANS` or `PLAN/OK/FAIL`. The panel is removed before the Ctrl+C summary. Output redirected to a file or pipe, and terminals with `TERM=dumb`, automatically use plain timestamped logs without control sequences. To disable the panel explicitly:
+Logs appear above the panel, including with `-v`. Wide terminals show separate counters; medium terminals combine them under `SENT/OK/FAIL`. Below 76 columns, thread cards replace the table. Metadata uses additional rows, so page capacity adapts to the available height. Very short terminals use a compact rotating view. When threads do not all fit, pages rotate every eight seconds with a page indicator; totals include every tracked thread, including those on other pages. Dry-run rows display planned operations instead of real submissions, labelled `PLANS` or `PLAN/OK/FAIL`. The panel is removed before the Ctrl+C summary. Output redirected to a file or pipe, and terminals with `TERM=dumb`, automatically use plain timestamped logs without control sequences. To disable the panel explicitly:
 
 ```bash
 python codex_multi_recovery.py --no-live -v
@@ -216,6 +235,8 @@ python -m unittest discover -s tests -v
 A real macOS test with Codex 0.164.0 confirmed Goal resume requests accepted for two threads after 503 and model-not-found failures, followed by both threads becoming active. Local real-server checks also passed WebSocket initialization and thread listing. Simulated tests covered two-thread error handling, deduplication, virtual-clock backoff timing, successful-turn reset, quota eligibility and summary accounting. Display checks cover terminal sizes from 24×8 to 150×32, 40 threads rotating through every page, long Unicode names, colliding ID suffixes, monochrome output, dry-run counters, timestamp sanitizing, and a real pseudo-terminal run with live refresh, interleaved events and Ctrl+C cleanup. The display tests use a simulated daemon; they do not establish new live-provider recovery coverage.
 
 A Linux end-to-end test on 2026-10-28 used the production monitor in a real pseudo-terminal, Codex 0.164.0 over localhost WebSocket, and real streamed `gpt-6-luna` requests at `low` reasoning through the user's authorized provider. A dynamic wait tool kept the thread active for 65 seconds, with 13 active-status samples and continuous panel refresh. After the initial turn completed, a local forwarding relay injected exactly one HTTP 503. The monitor observed one failed turn, sent one `Continue`, and observed the recovery turn complete. The Ctrl+C summary reported one Continue attempt, one success, zero failures and zero unresolved attempts; cursor restoration also passed. The provider's upstream service was not interrupted. CLI request retries were disabled for this controlled fault test.
+
+A further real Codex 0.164.0 protocol test used two threads and a local HTTP endpoint returning the exact configuration-update error. It confirmed `gpt-6.1-sol/high` → `gpt-6-sol/high` for a prompt and `gpt-6-astra/max` → `gpt-6-sol/max` for a Goal. The outgoing fallback request bodies retained those reasoning levels. Each thread received one recovery; the second failure disabled further recovery and left the Goal paused. Request counts remained unchanged during an additional eight-second observation. This was a deterministic local fault test, not evidence of a real provider usage-limit reset. Simulated tests also cover recurrence after an intervening success, rejected/unconfirmed switches, unset-effort resolution and dry-run isolation.
 
 The sandbox's earlier `thread/start` hang was isolated to project-instruction discovery: setting `project_doc_max_bytes = 0` in the empty, isolated test workspace allowed startup in about 0.03 seconds. This was a test-environment configuration, not a change to the watcher or a recommended setting for user projects.
 

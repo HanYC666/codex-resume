@@ -46,7 +46,7 @@ class RPC:
             self.ws = websocket.create_connection(path if is_url else 'ws://localhost/', socket=raw,
                                                   timeout=timeout, enable_multithread=True, suppress_origin=True)
             log('WebSocket handshake accepted')
-            self.call('initialize', {'clientInfo': {'name':'codex-recovery','title':'Codex recovery','version':'0.5'}, 'capabilities': {'experimentalApi':True,'requestAttestation':False}})
+            self.call('initialize', {'clientInfo': {'name':'codex-recovery','title':'Codex recovery','version':'0.6'}, 'capabilities': {'experimentalApi':True,'requestAttestation':False}})
             self.send({'method':'initialized','params':{}})
             log('Initialization complete')
         except Exception as e:
@@ -108,8 +108,51 @@ def blocked_error(error):
 
 BACKOFF_SECONDS = 15 * 60
 
+MODEL_FALLBACKS = {'gpt-6.1-sol':'gpt-6-sol', 'gpt-6-astra':'gpt-6-sol'}
+
+def configuration_update_error(error):
+    """Provider-specific trigger; this error alone does not establish a usage cap."""
+    text=json.dumps(error,ensure_ascii=False).lower()
+    return 'configuration_update' in text and ('invalid input type' in text or 'invalid_input_type' in text)
+
+def read_goal(rpc, tid):
+    try: return rpc.call('thread/goal/get',{'threadId':tid}).get('goal')
+    except RPCRejected as exc:
+        if 'goals feature is disabled' in str(exc).lower(): return None
+        raise
+
+def stop_recovery(rpc, tid, state, goal, reason, dry_run):
+    state.stopped=reason
+    state.next_retry=None
+    event(('DRY RUN: ' if dry_run else '')+'Thread '+tid+': automatic recovery stopped — '+reason)
+    # The triggering turn is already failed. Pause its Goal to stop autonomous retries.
+    if goal and goal.get('status')!='complete':
+        if not dry_run:
+            fresh=rpc.call('thread/read',{'threadId':tid,'includeTurns':False})['thread']
+            status=fresh.get('status') or {}
+            if status.get('type') not in ('idle','systemError') or status.get('activeFlags'):
+                return  # A manual resume is already working; leave it alone.
+            current=read_goal(rpc,tid)
+            if not current or current.get('status')=='complete':
+                state.goal_status=current.get('status') if current else None
+                return
+            rpc.call('thread/goal/set',{'threadId':tid,'status':'paused','origin':'user'})
+        state.goal_status='paused'
+
+
+def fallback_effort(rpc, thread):
+    effort=thread.get('reasoningEffort')
+    if effort: return effort
+    # An unset effort means the model default; resolve it rather than silently
+    # accepting a possibly different default on the fallback model.
+    for model in pages(rpc,'model/list',{'limit':100}):
+        if thread.get('model') in (model.get('id'),model.get('model')):
+            return model.get('defaultReasoningEffort')
+    return None
+
 def error_identity(error):
     """Ignore per-request IDs while keeping distinct failure categories."""
+    if configuration_update_error(error): return 'invalid_configuration_update_input'
     message = str(error.get('message', '') if isinstance(error, dict) else error).lower()
     if 'model_not_found' in message:
         model = re.search(r"['\"]([a-z0-9._-]+)['\"] model", message)
@@ -138,6 +181,16 @@ class RecoveryState:
         self.last_attempt = None
         self.slow = False
         self.next_retry = None
+        self.model = None
+        self.effort = None
+        self.goal_status = 'unknown'
+        self.stopped = None
+        self.fallback_target = None
+        self.fallback_effort = None
+        self.fallback_turn = None
+        self.fallback_confirmed = False
+        self.fallback_checks = 0
+        self.fallback_recovery_sent = False
 
     def completed_since_failure(self, turns):
         if not self.last_failed_id: return False
@@ -300,7 +353,11 @@ class Dashboard:
              'plans':len(entries)-len(live),'slow':bool(state and state.slow),
              'attempted_latest':bool(state and turns and turns[0].get('id') in state.attempted_turns),
              'excluded':bool(turns and turns[0].get('status')=='failed' and blocked_error(turns[0].get('error'))),
-             'deadline':state.next_retry if state else None}
+             'deadline':state.next_retry if state else None,
+             'model':state.model if state else None, 'effort':state.effort if state else None,
+             'goal_status':state.goal_status if state else 'unknown',
+             'stopped':state.stopped if state else None,
+             'switching':bool(state and state.fallback_target and not state.fallback_confirmed and not state.stopped and not self.dry_run)}
         with self.lock:
             self.rows[tid]=row
             self.errors=len(stats.errors)
@@ -321,6 +378,8 @@ class Dashboard:
     @staticmethod
     def presentation(row):
         """State text, colour and stable display priority; colour is never the only cue."""
+        if row.get('stopped'): return 'Stopped', 'bold red', 0
+        if row.get('switching'): return 'Switching', 'bold yellow', 1
         if row['flags']:
             label='Approval' if 'waitingOnApproval' in row['flags'] else 'Needs input'
             return label, 'bold yellow', 0
@@ -369,6 +428,7 @@ class Dashboard:
             return text
 
         def next_retry(row):
+            if row.get('stopped'): return 'Auto off'
             if row['flags'] or row['kind']=='active' or row['excluded']: return '—'
             if row['slow'] and row['deadline'] is not None:
                 return duration(row['deadline']-now) if row['deadline']>now else 'Due now'
@@ -381,6 +441,17 @@ class Dashboard:
             text.truncate(max(1,cells-len(suffix)),overflow='ellipsis')
             text.append(suffix,style='dim')
             return text
+
+        def model_depth(row):
+            return (row.get('model') or 'Model ?')+' · '+(row.get('effort') or 'default')
+
+        def mode(row):
+            status=row.get('goal_status')
+            if status=='unknown': return 'Mode ?'
+            if status in (None,'complete'): return 'Prompt'
+            labels={'active':'Goal active','paused':'Goal paused','blocked':'Goal blocked',
+                    'usageLimited':'Goal limited','budgetLimited':'Goal budget'}
+            return labels.get(status,'Goal '+str(status))
 
         def counts(row):
             return line((str(row['plans'] if self.dry_run else row['attempts']),'bold'), ' / ',(str(row['successes']),'green'),
@@ -402,6 +473,7 @@ class Dashboard:
                 index=int(max(0,now-self.started)//8)%len(rows)
                 tid,row=rows[index]; label,style,_=self.presentation(row)
                 compact.append(line((label+' ',style),name(tid,row,max(1,inner-len(label)-1))))
+                compact.append(line((model_depth(row),'dim'),' · ',(mode(row),'magenta')))
                 compact.append(line(('15m' if row['slow'] else 'Immediate','yellow' if row['slow'] else 'dim'),
                                     ' · ',next_retry(row)))
                 compact.append(line((('Plans '+str(row['plans']) if self.dry_run else 'Sent '+str(row['attempts'])),'bold'),' · ',('OK '+str(row['successes']),'green'),
@@ -419,13 +491,13 @@ class Dashboard:
         else: lines.extend([totals,Text('')])
         # Fixed-height, non-wrapping rows make the footer survive short terminals.
         overhead=8 if tiny else 9
-        capacity=max(1,(height-4-overhead)//(3 if tiny else 1))
+        capacity=max(1,(height-4-overhead)//(4 if tiny else 2))
         pages=max(1,(len(rows)+capacity-1)//capacity)
         page=int(max(0,now-self.started)//8)%pages
         shown=rows[page*capacity:(page+1)*capacity]
         table=Table(expand=True,box=None,padding=(0,1),header_style='dim')
-        table.add_column('THREAD',ratio=1,no_wrap=True,overflow='ellipsis')
-        table.add_column('STATE',width=11,no_wrap=True)
+        table.add_column('THREAD / MODEL · DEPTH',ratio=1,no_wrap=True,overflow='ellipsis')
+        table.add_column('STATE / MODE',width=13,no_wrap=True)
         if wide:
             for heading in (('PLANS' if self.dry_run else 'SENT'),'DONE','FAIL','PENDING'):
                 table.add_column(heading,justify='right',no_wrap=True)
@@ -436,24 +508,29 @@ class Dashboard:
             table.add_column('RETRY · NEXT',width=20,no_wrap=True)
         for tid,row in shown:
             label,style,_=self.presentation(row)
-            mode='15m' if row['slow'] else 'Immediate'
+            retry_mode='Off' if row.get('stopped') else '15m' if row['slow'] else 'Immediate'
             timing=next_retry(row)
             if tiny:
                 label_text=line((label,style))
                 title_text=name(tid,row,max(1,inner-len(label)-3))
                 lines.append(line(title_text,' · ',label_text))
+                lines.append(line((model_depth(row),'dim')))
                 lines.append(line((('Plans '+str(row['plans']) if self.dry_run else 'Sent '+str(row['attempts'])),'bold'),' · ',('OK '+str(row['successes']),'green'),
                                   ' · ',('Fail '+str(row['failures']),'red' if row['failures'] else 'dim')))
-                lines.append(line((mode,'yellow' if row['slow'] else 'dim'),' · next ',timing))
+                lines.append(line((mode(row),'magenta'),' · ',(retry_mode,'yellow' if row['slow'] else 'dim'),' / ',timing))
             elif wide:
-                table.add_row(name(tid,row,max(8,inner-75)),Text(label,style=style),str(row['plans'] if self.dry_run else row['attempts']),
+                title_cell=name(tid,row,max(8,inner-77)); title_cell.append('\n'+model_depth(row),style='dim')
+                state_cell=Text(label,style=style); state_cell.append('\n'+mode(row),style='magenta')
+                table.add_row(title_cell,state_cell,str(row['plans'] if self.dry_run else row['attempts']),
                               Text(str(row['successes']),style='green'),Text(str(row['failures']),style='red' if row['failures'] else 'dim'),
                               Text(str(row['unresolved']),style='yellow' if row['unresolved'] else 'dim'),
-                              Text(mode,style='yellow' if row['slow'] else 'dim'),Text(timing,style=style if row['slow'] else 'dim'))
+                              Text(retry_mode,style='yellow' if row['slow'] else 'dim'),Text(timing,style=style if row['slow'] else 'dim'))
             else:
                 # The short mode label preserves the countdown at 76–109 columns.
-                retry=line(('15m' if row['slow'] else 'Now','yellow' if row['slow'] else 'dim'),' · ',timing)
-                table.add_row(name(tid,row,max(8,inner-53)),Text(label,style=style),counts(row),retry)
+                retry=line(('Off' if row.get('stopped') else '15m' if row['slow'] else 'Now','yellow' if row['slow'] else 'dim'),' · ',timing)
+                title_cell=name(tid,row,max(8,inner-55)); title_cell.append('\n'+model_depth(row),style='dim')
+                state_cell=Text(label,style=style); state_cell.append('\n'+mode(row),style='magenta')
+                table.add_row(title_cell,state_cell,counts(row),retry)
         if not rows:
             lines.append(line(('Waiting for a working thread to appear.','dim')))
         elif not tiny: lines.append(table)
@@ -500,7 +577,7 @@ def run(rpc, dry_run, interval, stats=None, dashboard=None):
                 ids=list(pages(rpc,'thread/loaded/list',{'limit':100}))
                 log('Loaded threads (%d): %s' % (len(ids), ', '.join(ids) or 'none'))
                 for tid in ids:
-                    thread=None; state=None; turns=[]; title=tid; status={}
+                    thread=None; state=None; turns=[]; title=tid; status={}; goal=None
                     try:
                         thread=rpc.call('thread/read',{'threadId':tid,'includeTurns':False})['thread']
                         if thread.get('parentThreadId'):
@@ -520,11 +597,26 @@ def run(rpc, dry_run, interval, stats=None, dashboard=None):
                         if tid not in tracked:
                             log('Thread %s: skipped, not observed working' % tid); continue
                         state=states.setdefault(tid, RecoveryState())
+                        state.model=thread.get('model')
+                        state.effort=thread.get('reasoningEffort')
+                        goal=read_goal(rpc,tid)
+                        state.goal_status=goal.get('status') if goal else None
                         turns=rpc.call('thread/turns/list',{'threadId':tid,'limit':10,'sortDirection':'desc'}).get('data',[])
                         previous_errors=len(stats.errors)
                         stats.observe(tid,turns)
                         if len(stats.errors)>previous_errors:
                             event('Thread %s: failed turn detected (%s)' % (title,error_identity(turns[0].get('error'))))
+                        if state.stopped:
+                            log('Thread %s: automatic recovery disabled: %s' % (tid,state.stopped)); continue
+                        if state.fallback_target and not state.fallback_confirmed and not dry_run:
+                            if state.model==state.fallback_target and state.effort==state.fallback_effort:
+                                state.fallback_confirmed=True
+                                event('Thread %s: fallback confirmed: %s / %s' % (title,state.model,state.effort))
+                            else:
+                                state.fallback_checks+=1
+                                if state.fallback_checks>=3:
+                                    stop_recovery(rpc,tid,state,goal,'model switch could not be confirmed',dry_run)
+                                continue
                         if state.completed_since_failure(turns):
                             state.reset()
                             event('Thread %s: successful turn observed; normal retry rate restored' % title,flush=True)
@@ -544,32 +636,61 @@ def run(rpc, dry_run, interval, stats=None, dashboard=None):
                         if blocked_error(turn.get('error')):
                             log('Thread %s: skipped, missing error or excluded error category' % tid); continue
                         now=time.monotonic()
+                        special=configuration_update_error(turn.get('error'))
+                        if special and state.fallback_confirmed and turn_id!=state.fallback_turn:
+                            stop_recovery(rpc,tid,state,goal,'configuration_update error repeated after fallback; no retries',dry_run)
+                            continue
+                        if special and not state.fallback_target:
+                            target=MODEL_FALLBACKS.get(state.model)
+                            effort=fallback_effort(rpc,thread) if target else None
+                            if not target or not effort:
+                                stop_recovery(rpc,tid,state,goal,'no configured fallback or reasoning level unavailable',dry_run)
+                                continue
+                            fresh=rpc.call('thread/read',{'threadId':tid,'includeTurns':False})['thread']
+                            latest=rpc.call('thread/turns/list',{'threadId':tid,'limit':1,'sortDirection':'desc'}).get('data',[])
+                            fresh_status=fresh.get('status') or {}
+                            if fresh_status.get('type') not in ('idle','systemError') or fresh_status.get('activeFlags'): continue
+                            if not latest or latest[0].get('id')!=turn_id or latest[0].get('status')!='failed': continue
+                            if fresh.get('model')!=state.model or fresh.get('reasoningEffort')!=state.effort: continue
+                            state.fallback_target=target; state.fallback_effort=effort; state.fallback_turn=turn_id
+                            event(('DRY RUN: ' if dry_run else '')+'Thread '+str(title)+': fallback '+state.model+' → '+target+' / '+effort)
+                            if dry_run:
+                                # Record the plan without pretending the server switched models.
+                                state.fallback_recovery_sent=True
+                            else:
+                                try: rpc.call('thread/settings/update',{'threadId':tid,'model':target,'effort':effort})
+                                except RPCError:
+                                    state.stopped='model switch rejected or outcome unknown'
+                                    raise
+                                continue
                         if state.failure(turn, now):
                             event('Thread %s: entering 15-minute retry mode (%d consecutive errors; %d matching)' % (title,state.consecutive,state.same_error),flush=True)
-                        if not state.ready(turn_id, now):
+                        switching_recovery=bool(special and state.fallback_confirmed and not state.fallback_recovery_sent)
+                        if not switching_recovery and not state.ready(turn_id, now):
                             if state.slow:
                                 log('Thread %s: backoff; next retry in %.1fs' % (tid,max(0,state.next_retry-now)))
                             else: log('Thread %s: skipped, already attempted this turn' % tid)
                             continue
-                        # This is the latest failed turn of a thread observed working in this run.
-                        try: goal=rpc.call('thread/goal/get',{'threadId':tid}).get('goal')
-                        except RPCError as e:
-                            if 'goals feature is disabled' in str(e).lower(): goal=None
-                            else: raise
                         log('Thread %s goal status=%s' % (tid, goal.get('status') if goal else 'none'))
                         action='resume goal' if goal and goal.get('status')!='complete' else 'Continue'
                         event(('DRY RUN: ' if dry_run else '')+action+' for '+str(title)+' ('+tid+', turn '+turn_id+')',flush=True)
                         if not dry_run:
                             # Recheck just before mutation; leave user-input and active states alone.
                             fresh=rpc.call('thread/read',{'threadId':tid,'includeTurns':False})['thread']
-                            if fresh.get('status',{}).get('type') not in ('idle','systemError'): event('Skipped: status changed',flush=True); continue
+                            if fresh.get('status',{}).get('activeFlags') or fresh.get('status',{}).get('type') not in ('idle','systemError'): event('Skipped: status changed',flush=True); continue
+                            if switching_recovery and (fresh.get('model')!=state.fallback_target or fresh.get('reasoningEffort')!=state.fallback_effort):
+                                state.stopped='settings changed before fallback recovery'
+                                event('Thread %s: recovery stopped; model/reasoning changed before submission' % title)
+                                continue
                             latest=rpc.call('thread/turns/list',{'threadId':tid,'limit':1,'sortDirection':'desc'}).get('data',[])
                             if not latest or latest[0].get('id')!=turn_id or latest[0].get('status')!='failed': event('Skipped: turn changed',flush=True); continue
                         # Record only after the preflight checks. Failures with ambiguous
                         # submission outcomes are retained as attempts, never sent twice rapidly.
                         state.record(turn_id, time.monotonic())
+                        if switching_recovery: state.fallback_recovery_sent=True
                         entry={'time':time.time(),'thread_id':tid,'turn_id':turn_id,
                                'action':action,'error':state.last_error,'slow':state.slow,
+                               'model':state.model,'effort':state.effort,'fallback':switching_recovery,
                                'outcome':'dry-run' if dry_run else 'pending',
                                'result':'dry-run' if dry_run else 'pending'}
                         stats.record(entry)
