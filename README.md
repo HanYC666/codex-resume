@@ -12,7 +12,7 @@ This is an independent project, not an official OpenAI tool.
 - Python **3.10 or newer**, with `venv` and pip.
 - Git to clone the repository.
 - An installed and configured Codex CLI. The tested version is **0.164.0**; compatibility with other versions is not guaranteed because the app-server protocol can change.
-- The Python package listed in [`requirements.txt`](requirements.txt): `websocket-client`.
+- The Python package listed in [`requirements.txt`](requirements.txt): `websocket-client` and `rich`.
 
 The watcher uses the existing daemon's authentication. Do not put API keys in this repository or pass a key to the watcher. Configure your model provider in Codex itself.
 
@@ -122,6 +122,34 @@ The watcher does not approve permission requests or security notices. Safety/per
 
 Each recovery records its time, thread/turn ID, action, normalized error category, retry mode and outcome **in memory only**. Nothing is saved to a history file. History and counters are discarded when the program exits. With `-v`, recovery records and backoff countdowns are printed to the terminal.
 
+## Live terminal status
+
+An interactive terminal displays a live panel below the scrolling event log. It refreshes once per second, including while the monitor waits between polls or for an RPC response. Events include local timestamps with the date and UTC offset, for example `[2026-10-28 22:37:36+1300]`.
+
+The panel shows:
+
+- Active, paused/waiting, ready and tracked thread counts (tracked root threads only).
+- Distinct errors and total recovery attempts, successes and failures.
+- Each thread's state, attempts, successful and failed recoveries, pending outcomes, retry mode and next-retry countdown.
+- Poll interval, next poll, age of the last completed poll, uptime and current RPC activity.
+
+“Immediate” means an eligible new failed turn can be recovered as soon as polling detects it; “15m” means the thread is in slow retry mode. The poll interval remains five seconds by default. “Success” requires an observed completed recovery turn; accepting a command or becoming active does not count. Counts combine Continue and Goal resume for each thread; the exit summary separates them. Dry-run plans are labelled separately and do not inflate real attempt or success counters.
+
+Logs appear above the panel, including with `-v`. Narrow terminals use compact columns; short terminals show as many thread rows as fit and indicate hidden rows. The panel is removed before the Ctrl+C summary. Output redirected to a file or pipe, and terminals with `TERM=dumb`, automatically use plain timestamped logs without control sequences. To disable the panel explicitly:
+
+```bash
+python codex_multi_recovery.py --no-live -v
+```
+
+After updating an existing installation, install the new display dependency:
+
+```bash
+git pull
+source .venv/bin/activate
+python -m pip install -r requirements.txt
+python codex_multi_recovery.py
+```
+
 ## Ctrl+C run summary
 
 The summary includes distinct errors observed, total commands attempted, and separate `Continue` and `Goal resume` rows:
@@ -146,6 +174,7 @@ python codex_multi_recovery.py --help
 | Option | Purpose | Default |
 | --- | --- | --- |
 | `-v`, `--verbose` | Detailed RPC activity, thread states, decisions and retry records | Off |
+| `--no-live` | Disable the live panel; keep timestamped logs | Off |
 | `--dry-run` | Log planned operations without sending recovery commands | Off |
 | `--check` | Initialize, list loaded thread IDs, and exit without recovery | Off |
 | `--interval SECONDS` | Normal polling interval; must be positive | `5` |
@@ -172,9 +201,15 @@ python codex_multi_recovery.py --socket /path/to/app-server-control.sock -v
 
 Verbose logs can include conversation titles, provider URLs and error messages. Inspect logs before sharing them.
 
+## Development checks
+
+```bash
+python -m unittest discover -s tests -v
+```
+
 ## Validation and limits
 
-A real macOS test with Codex 0.164.0 confirmed Goal resume requests accepted for two threads after 503 and model-not-found failures, followed by both threads becoming active. Local real-server checks also passed WebSocket initialization and thread listing. Simulated tests covered two-thread error handling, deduplication, virtual-clock backoff timing, successful-turn reset, quota eligibility and summary accounting.
+A real macOS test with Codex 0.164.0 confirmed Goal resume requests accepted for two threads after 503 and model-not-found failures, followed by both threads becoming active. Local real-server checks also passed WebSocket initialization and thread listing. Simulated tests covered two-thread error handling, deduplication, virtual-clock backoff timing, successful-turn reset, quota eligibility and summary accounting. Display checks cover 40-, 80- and 140-column layouts, dry-run counters, timestamp sanitizing, and a real pseudo-terminal run with live refresh, interleaved events and Ctrl+C cleanup. The display tests use a simulated daemon; they do not establish new live-provider recovery coverage.
 
 The full recovery loop has not been validated on Linux, and the new 15-minute policy has not been tested through a live five-hour quota reset. Treat compatibility with future Codex releases as unverified.
 

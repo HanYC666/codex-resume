@@ -1,2 +1,3 @@
-# Runtime dependency; Python 3.10+ is required by this tested release.
+# Runtime dependencies; Python 3.10+ is required.
 websocket-client==1.9.2
+rich==14.2.0
