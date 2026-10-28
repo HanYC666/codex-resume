@@ -12,6 +12,7 @@ from unittest.mock import patch
 
 import codex_multi_recovery as monitor
 from rich.console import Console
+from rich.cells import cell_len
 
 
 class FakeDaemon:
@@ -117,6 +118,51 @@ class MonitorTests(unittest.TestCase):
         self.assertNotIn('\x1b', value)
         self.assertNotIn('a' * 32, value)
         self.assertEqual(value.count('\n'), 1)
+
+    def test_all_threads_rotate_into_view_without_hiding_the_footer(self):
+        dashboard=monitor.Dashboard(5,enabled=False)
+        dashboard.started=100
+        for n in range(40):
+            dashboard.update_thread('same-prefix-%04d' % n, 'task-%02d' % n,
+                                    {'type':'active'},[],monitor.RecoveryState(),monitor.RunStats([]))
+        sink=io.StringIO()
+        dashboard.console=Console(file=sink,width=80,height=24,color_system=None)
+        frames=[]
+        for page in range(4):
+            with patch.object(monitor.time,'monotonic',return_value=100+page*8):
+                dashboard.console.print(dashboard.render())
+            frame=sink.getvalue(); sink.seek(0); sink.truncate()
+            self.assertLessEqual(len(frame.splitlines()),20)
+            self.assertIn('rotates 8s',frame)
+            self.assertIn('Ctrl+C summary',frame)
+            frames.append(frame)
+        for n in range(40): self.assertIn('task-%02d' % n, ''.join(frames))
+
+    def test_long_unicode_names_unique_ids_and_small_terminal_layouts(self):
+        dashboard=monitor.Dashboard(5,enabled=False)
+        for tid in ('same-prefix-aaaa1dead','same-prefix-bbbb1dead'):
+            dashboard.update_thread(tid,'研究筆記 '*30,{'type':'active'},[],monitor.RecoveryState(),monitor.RunStats([]))
+        for width,height in ((24,8),(40,16),(60,20),(80,24),(110,24),(150,32)):
+            sink=io.StringIO()
+            dashboard.console=Console(file=sink,width=width,height=height,color_system=None)
+            dashboard.console.print(dashboard.render())
+            frame=sink.getvalue()
+            self.assertLessEqual(len(frame.splitlines()),height-2)
+            self.assertLessEqual(max(map(cell_len,frame.splitlines())),width)
+            self.assertIn('Working',frame)
+            if width>=60:
+                self.assertIn('#a1dead',frame)
+                self.assertIn('#b1dead',frame)
+
+    def test_dry_run_and_empty_screen_are_explicit_without_colour(self):
+        dashboard=monitor.Dashboard(5,dry_run=True,enabled=False)
+        sink=io.StringIO(); dashboard.console=Console(file=sink,width=80,height=24,color_system=None)
+        dashboard.console.print(dashboard.render())
+        frame=sink.getvalue()
+        self.assertIn('DRY RUN',frame)
+        self.assertIn('nothing sent',frame)
+        self.assertIn('Waiting for a working thread',frame)
+        self.assertNotIn('\x1b',frame)
 
     def test_live_terminal_refresh_logs_and_ctrl_c_cleanup(self):
         master, slave = pty.openpty()

@@ -4,7 +4,7 @@ Automatically recover stopped Codex threads from one monitor on macOS or Linux. 
 
 It observes working root threads, detects failed turns, and resumes an incomplete Goal or submits `Continue`. Repeated failures switch that thread to a 15-minute retry interval, allowing another attempt after a temporary outage or usage cap clears.
 
-This is an independent project, not an official OpenAI tool.
+This repository contains the **free terminal monitor**. A desktop app is planned separately. This is an independent project, not an official OpenAI tool.
 
 ## Requirements
 
@@ -135,7 +135,11 @@ The panel shows:
 
 “Immediate” means an eligible new failed turn can be recovered as soon as polling detects it; “15m” means the thread is in slow retry mode. The poll interval remains five seconds by default. “Success” requires an observed completed recovery turn; accepting a command or becoming active does not count. Counts combine Continue and Goal resume for each thread; the exit summary separates them. Dry-run plans are labelled separately and do not inflate real attempt or success counters.
 
-Logs appear above the panel, including with `-v`. Narrow terminals use compact columns; short terminals show as many thread rows as fit and indicate hidden rows. The panel is removed before the Ctrl+C summary. Output redirected to a file or pipe, and terminals with `TERM=dumb`, automatically use plain timestamped logs without control sequences. To disable the panel explicitly:
+The panel uses cyan for working threads, green for ready threads and completed recoveries, yellow for backoff or input requests, and red for errors or attention needed. State labels remain visible with colour disabled. `Done` counts completed recovery turns, not completed tasks. `Paused` includes threads waiting for input, in backoff, stopped on an error, or otherwise not working or ready.
+
+Every row includes a short unique ID suffix, so identical or shortened titles remain distinguishable. Long names, including Unicode names, are shortened by terminal-cell width. Threads needing attention appear first, followed by errors, backoff, working and ready/paused threads. This is display ordering only; it does not change recovery decisions or polling.
+
+Logs appear above the panel, including with `-v`. Wide terminals show separate counters; medium terminals combine them under `SENT/OK/FAIL`. Below 76 columns, thread cards replace the table. Very short terminals use a compact rotating view. When threads do not all fit, pages rotate every eight seconds with a page indicator; totals include every tracked thread, including those on other pages. Dry-run rows display planned operations instead of real submissions, labelled `PLANS` or `PLAN/OK/FAIL`. The panel is removed before the Ctrl+C summary. Output redirected to a file or pipe, and terminals with `TERM=dumb`, automatically use plain timestamped logs without control sequences. To disable the panel explicitly:
 
 ```bash
 python codex_multi_recovery.py --no-live -v
@@ -209,7 +213,7 @@ python -m unittest discover -s tests -v
 
 ## Validation and limits
 
-A real macOS test with Codex 0.164.0 confirmed Goal resume requests accepted for two threads after 503 and model-not-found failures, followed by both threads becoming active. Local real-server checks also passed WebSocket initialization and thread listing. Simulated tests covered two-thread error handling, deduplication, virtual-clock backoff timing, successful-turn reset, quota eligibility and summary accounting. Display checks cover 40-, 80- and 140-column layouts, dry-run counters, timestamp sanitizing, and a real pseudo-terminal run with live refresh, interleaved events and Ctrl+C cleanup. The display tests use a simulated daemon; they do not establish new live-provider recovery coverage.
+A real macOS test with Codex 0.164.0 confirmed Goal resume requests accepted for two threads after 503 and model-not-found failures, followed by both threads becoming active. Local real-server checks also passed WebSocket initialization and thread listing. Simulated tests covered two-thread error handling, deduplication, virtual-clock backoff timing, successful-turn reset, quota eligibility and summary accounting. Display checks cover terminal sizes from 24×8 to 150×32, 40 threads rotating through every page, long Unicode names, colliding ID suffixes, monochrome output, dry-run counters, timestamp sanitizing, and a real pseudo-terminal run with live refresh, interleaved events and Ctrl+C cleanup. The display tests use a simulated daemon; they do not establish new live-provider recovery coverage.
 
 A Linux end-to-end test on 2026-10-28 used the production monitor in a real pseudo-terminal, Codex 0.164.0 over localhost WebSocket, and real streamed `gpt-6-luna` requests at `low` reasoning through the user's authorized provider. A dynamic wait tool kept the thread active for 65 seconds, with 13 active-status samples and continuous panel refresh. After the initial turn completed, a local forwarding relay injected exactly one HTTP 503. The monitor observed one failed turn, sent one `Continue`, and observed the recovery turn complete. The Ctrl+C summary reported one Continue attempt, one success, zero failures and zero unresolved attempts; cursor restoration also passed. The provider's upstream service was not interrupted. CLI request retries were disabled for this controlled fault test.
 

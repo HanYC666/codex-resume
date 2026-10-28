@@ -254,6 +254,7 @@ class Dashboard:
         self.lock=threading.RLock()
         self.rows={}
         self.errors=self.attempts=self.successes=self.failures=0
+        self.pending=self.plans=0
         self.last_poll=None
         self.next_poll=None
         self.activity='Starting monitor'
@@ -307,6 +308,8 @@ class Dashboard:
             self.attempts=len(sent)
             self.successes=sum(e.get('result')=='success' for e in sent)
             self.failures=sum(e.get('result')=='failed' for e in sent)
+            self.pending=sum(e.get('result') in ('pending','unknown') for e in sent)
+            self.plans=len(stats.history)-len(sent)
 
     def finish_poll(self, loaded, delay, failed=False):
         with self.lock:
@@ -314,6 +317,30 @@ class Dashboard:
             if not failed: self.last_poll=time.monotonic()
             self.next_poll=time.monotonic()+delay
             self.activity='Poll failed; waiting to retry' if failed else 'Waiting for next poll'
+
+    @staticmethod
+    def presentation(row):
+        """State text, colour and stable display priority; colour is never the only cue."""
+        if row['flags']:
+            label='Approval' if 'waitingOnApproval' in row['flags'] else 'Needs input'
+            return label, 'bold yellow', 0
+        if row['kind']=='active': return 'Working', 'bold cyan', 3
+        if row['excluded']: return 'Attention', 'bold red', 0
+        if row['kind']=='idle' and row['turn']=='completed': return 'Ready', 'green', 4
+        if row['slow']: return 'Backoff', 'yellow', 2
+        if row['kind']=='systemError' or row['turn']=='failed': return 'Error', 'bold red', 1
+        return 'Paused', 'dim', 4
+
+    @staticmethod
+    def short_ids(ids):
+        # UUID prefixes often share a timestamp; choose unique suffixes instead.
+        result={}
+        for tid in ids:
+            size=min(4,len(tid))
+            while size<len(tid) and any(other!=tid and other.endswith(tid[-size:]) for other in ids):
+                size+=1
+            result[tid]=tid[-size:]
+        return result
 
     def render(self):
         from rich.console import Group
@@ -323,62 +350,128 @@ class Dashboard:
         with self.lock:
             rows=list(self.rows.items())
             errors,attempts,successes,failures=self.errors,self.attempts,self.successes,self.failures
-            activity,last_poll,next_poll,polls=self.activity,self.last_poll,self.next_poll,self.polls
+            activity,last_poll,next_poll=self.activity,self.last_poll,self.next_poll
+            pending,plans=self.pending,self.plans
         now=time.monotonic()
         width,height=self.console.size if self.console else (100,24)
+        inner=max(1,width-4)
+        tiny=width<76
+        micro=height<16 or width<32
+        wide=width>=110
+        ids=self.short_ids([tid for tid,_ in rows])
+        rows.sort(key=lambda item:(self.presentation(item[1])[2],item[1]['title'].casefold(),item[0]))
         active=sum(r['kind']=='active' and not r['flags'] for _,r in rows)
-        ready=sum(r['kind']=='idle' and r['turn']=='completed' and not r['flags'] for _,r in rows)
+        ready=sum(self.presentation(r)[0]=='Ready' for _,r in rows)
         paused=len(rows)-active-ready
-        lines=[Text('Active threads: %d | Paused/waiting: %d | Ready: %d | Tracked: %d' % (active,paused,ready,len(rows)),style='bold'),
-               Text('Errors: %d | Resume attempts: %d | Successful: %d | Failed: %d' % (errors,attempts,successes,failures))]
-        table=Table(expand=True,box=None,padding=(0,1))
-        narrow=width<85
-        table.add_column('Thread',ratio=2,overflow='ellipsis',no_wrap=True)
-        table.add_column('State',ratio=1,overflow='ellipsis',no_wrap=True)
-        if narrow:
-            table.add_column('Try/OK/Fail',no_wrap=True)
-            table.add_column('Retry / next',ratio=1,overflow='ellipsis',no_wrap=True)
+
+        def line(*parts):
+            text=Text.assemble(*parts, no_wrap=True, overflow='ellipsis')
+            return text
+
+        def next_retry(row):
+            if row['flags'] or row['kind']=='active' or row['excluded']: return '—'
+            if row['slow'] and row['deadline'] is not None:
+                return duration(row['deadline']-now) if row['deadline']>now else 'Due now'
+            if row['attempted_latest']: return 'Awaiting turn'
+            return 'Next poll' if row['turn']=='failed' else '—'
+
+        def name(tid,row,cells):
+            suffix=' #'+ids[tid]
+            text=Text(row['title'].strip() or 'Untitled',style='bold')
+            text.truncate(max(1,cells-len(suffix)),overflow='ellipsis')
+            text.append(suffix,style='dim')
+            return text
+
+        def counts(row):
+            return line((str(row['plans'] if self.dry_run else row['attempts']),'bold'), ' / ',(str(row['successes']),'green'),
+                        ' / ',(str(row['failures']),'red' if row['failures'] else 'dim'))
+
+        header=line(('Active '+str(active),'bold cyan'), '   ',('Paused '+str(paused),'yellow' if paused else 'dim'),
+                    '   ',('Ready '+str(ready),'green' if ready else 'dim'))
+        totals=line(('Sent '+str(attempts),'bold'), '   ',('Done '+str(successes),'green'),
+                    '   ',('Failed '+str(failures),'red' if failures else 'dim'),
+                    '   ',('Pending '+str(pending),'yellow' if pending else 'dim'))
+        border='yellow' if self.dry_run else 'cyan'
+        title=Text('Codex recovery',style='bold')
+        if self.dry_run: title.append(' · DRY RUN',style='yellow')
+        if micro:
+            # Keep at least two terminal lines available for log events.
+            limit=max(1,height-4)
+            compact=[header]
+            if rows:
+                index=int(max(0,now-self.started)//8)%len(rows)
+                tid,row=rows[index]; label,style,_=self.presentation(row)
+                compact.append(line((label+' ',style),name(tid,row,max(1,inner-len(label)-1))))
+                compact.append(line(('15m' if row['slow'] else 'Immediate','yellow' if row['slow'] else 'dim'),
+                                    ' · ',next_retry(row)))
+                compact.append(line((('Plans '+str(row['plans']) if self.dry_run else 'Sent '+str(row['attempts'])),'bold'),' · ',('OK '+str(row['successes']),'green'),
+                                    ' · ',('Fail '+str(row['failures']),'red' if row['failures'] else 'dim')))
+            else: compact.append(line(('Waiting for working threads','dim')))
+            if self.dry_run: compact.append(line(('Simulation · '+str(plans)+' plans; nothing sent','yellow')))
+            return Panel(Group(*compact[:limit]),title=title,border_style=border,padding=(0,1),
+                         subtitle=Text(('%d/%d · rotates 8s · ' % (index+1,len(rows)) if rows else '')+'Ctrl+C summary',style='dim'))
+
+        lines=[header]
+        if tiny:
+            lines.extend([line(('Sent '+str(attempts),'bold'),' · ',('Errors '+str(errors),'red' if errors else 'dim')),
+                          line(('Done '+str(successes),'green'),' · ',('Fail '+str(failures),'red' if failures else 'dim'),
+                               ' · ',('Pending '+str(pending),'dim'))])
+        else: lines.extend([totals,Text('')])
+        # Fixed-height, non-wrapping rows make the footer survive short terminals.
+        overhead=8 if tiny else 9
+        capacity=max(1,(height-4-overhead)//(3 if tiny else 1))
+        pages=max(1,(len(rows)+capacity-1)//capacity)
+        page=int(max(0,now-self.started)//8)%pages
+        shown=rows[page*capacity:(page+1)*capacity]
+        table=Table(expand=True,box=None,padding=(0,1),header_style='dim')
+        table.add_column('THREAD',ratio=1,no_wrap=True,overflow='ellipsis')
+        table.add_column('STATE',width=11,no_wrap=True)
+        if wide:
+            for heading in (('PLANS' if self.dry_run else 'SENT'),'DONE','FAIL','PENDING'):
+                table.add_column(heading,justify='right',no_wrap=True)
+            table.add_column('RETRY',width=9,no_wrap=True)
+            table.add_column('NEXT',width=13,no_wrap=True)
         else:
-            for name in ('Attempts','Success','Failed','Pending','Retry interval','Next retry'):
-                table.add_column(name,no_wrap=True)
-        # Leave space for events in short terminals; totals still include hidden rows.
-        tiny=width<60
-        shown=rows[:max(1,(height-12)//(3 if tiny else 1))]
+            table.add_column('PLAN/OK/FAIL' if self.dry_run else 'SENT/OK/FAIL',width=12,no_wrap=True)
+            table.add_column('RETRY · NEXT',width=20,no_wrap=True)
         for tid,row in shown:
-            busy=row['kind']=='active'
-            flags=row['flags']
-            if flags: status='Needs approval' if 'waitingOnApproval' in flags else 'Needs input'
-            elif busy: status='Working'
-            elif row['turn']=='completed': status='Ready'
-            elif row['excluded']: status='Needs attention'
-            elif row['slow']: status='Backoff'
-            elif row['kind']=='systemError' or row['turn']=='failed': status='Error'
-            else: status='Paused'
-            retry='15m' if row['slow'] else 'Immediate'
-            if flags or busy or row['excluded']: next_retry='-'
-            elif row['slow'] and row['deadline'] is not None:
-                next_retry=duration(row['deadline']-now) if row['deadline']>now else 'due / checking'
-            elif row['attempted_latest']: next_retry='await new turn'
-            else: next_retry='next poll' if row['turn']=='failed' else '-'
-            name=row['title'] or tid[:8]
-            if sum(r['title']==row['title'] for _,r in rows)>1: name+=' ('+tid[:8]+')'
+            label,style,_=self.presentation(row)
+            mode='15m' if row['slow'] else 'Immediate'
+            timing=next_retry(row)
             if tiny:
-                lines.append(Text(name+' | '+status))
-                lines.append(Text('Try %d | OK %d | Fail %d' % (row['attempts'],row['successes'],row['failures'])))
-                lines.append(Text('Retry '+retry+' | Next '+next_retry))
-            elif narrow:
-                table.add_row(Text(name),Text(status),Text('%d/%d/%d' % (row['attempts'],row['successes'],row['failures'])),Text(retry+' / '+next_retry))
+                label_text=line((label,style))
+                title_text=name(tid,row,max(1,inner-len(label)-3))
+                lines.append(line(title_text,' · ',label_text))
+                lines.append(line((('Plans '+str(row['plans']) if self.dry_run else 'Sent '+str(row['attempts'])),'bold'),' · ',('OK '+str(row['successes']),'green'),
+                                  ' · ',('Fail '+str(row['failures']),'red' if row['failures'] else 'dim')))
+                lines.append(line((mode,'yellow' if row['slow'] else 'dim'),' · next ',timing))
+            elif wide:
+                table.add_row(name(tid,row,max(8,inner-75)),Text(label,style=style),str(row['plans'] if self.dry_run else row['attempts']),
+                              Text(str(row['successes']),style='green'),Text(str(row['failures']),style='red' if row['failures'] else 'dim'),
+                              Text(str(row['unresolved']),style='yellow' if row['unresolved'] else 'dim'),
+                              Text(mode,style='yellow' if row['slow'] else 'dim'),Text(timing,style=style if row['slow'] else 'dim'))
             else:
-                table.add_row(Text(name),Text(status),*[str(row[k]) for k in ('attempts','successes','failures','unresolved')],retry,next_retry)
-        if not rows: lines.append(Text('Waiting for working root threads on the shared daemon.'))
+                # The short mode label preserves the countdown at 76–109 columns.
+                retry=line(('15m' if row['slow'] else 'Now','yellow' if row['slow'] else 'dim'),' · ',timing)
+                table.add_row(name(tid,row,max(8,inner-53)),Text(label,style=style),counts(row),retry)
+        if not rows:
+            lines.append(line(('Waiting for a working thread to appear.','dim')))
         elif not tiny: lines.append(table)
-        if len(shown)<len(rows):lines.append(Text('%d more thread(s); enlarge the terminal to see them.' % (len(rows)-len(shown))))
-        if self.dry_run:lines.append(Text('DRY RUN: commands are simulated. Per-thread plans: '+', '.join(r['title']+': '+str(r['plans']) for _,r in shown),style='yellow'))
-        age='never' if last_poll is None else duration(now-last_poll)+' ago'
-        poll_countdown=duration(next_poll-now) if next_poll is not None else 'in progress'
-        lines.append(Text('Poll: %gs | Next: %s | Last: %s | Uptime: %s | Cycle: %d' % (self.interval,poll_countdown,age,duration(now-self.started),polls),style='dim'))
-        lines.append(Text(activity+' | Ctrl+C: stop and show summary',style='dim'))
-        return Panel(Group(*lines),title='Codex recovery'+(' — DRY RUN' if self.dry_run else ''),border_style='cyan')
+        poll=duration(next_poll-now) if next_poll is not None else 'polling'
+        age='—' if last_poll is None else duration(now-last_poll)
+        pager=('Page %d/%d · rotates 8s' % (page+1,pages)) if pages>1 else '%d thread%s' % (len(rows),'' if len(rows)==1 else 's')
+        lines.append(line((('Page %d/%d' % (page+1,pages)) if tiny and pages>1 else pager,'dim'),' · ',('poll %gs / %s' % (self.interval,poll),'dim')))
+        if self.dry_run:
+            lines.append(line(('SIMULATION · %d plans · nothing sent' % plans,'yellow')))
+        else:
+            updated='Updated '+age+' ago' if last_poll is not None else 'Waiting for first poll'
+            detail=updated+' · up '+duration(now-self.started)
+            if not tiny: detail='Errors '+str(errors)+' · '+detail
+            lines.append(line((detail,'dim')))
+        # Activity belongs in the border so it doesn't compete with thread rows.
+        activity=activity.replace('Waiting for next poll','Watching').replace('Polling threads','Polling')
+        return Panel(Group(*lines),title=title,title_align='left',border_style=border,padding=(0,1),
+                     subtitle=line((activity,'dim'),' · ',('Ctrl+C summary','dim')))
 
 def pages(rpc, method, params):
     cursor=None; seen=set()
