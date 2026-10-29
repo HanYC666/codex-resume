@@ -592,12 +592,13 @@ def run(rpc, dry_run, interval, stats=None, dashboard=None):
     dashboard=dashboard or Dashboard(interval,dry_run,enabled=False)
     keyboard=Keyboard(dashboard); suppressed=set(); forced=set()
     tracked={}; states={}; history=stats.history # Process-local, discarded on exit.
-    event('Monitoring active root threads from the shared Codex daemon. Ctrl-C to stop.', flush=True)
     try:
         dashboard.start()
+        event('Monitoring active root threads from the shared Codex daemon. Ctrl-C to stop.', flush=True)
         keyboard.start()
         if isinstance(rpc,RPC): rpc.on_activity=dashboard.set_activity
         while True:
+            if dashboard.terminal:dashboard.terminal.check_health()
             start=time.monotonic()
             keyboard.wake.clear()
             while not keyboard.commands.empty():

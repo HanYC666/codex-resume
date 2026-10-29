@@ -41,9 +41,16 @@ class TerminalUI:
         def previous(event): self.scroll(-self.history_height())
         @keys.add('pagedown')
         def next(event): self.scroll(self.history_height())
+        @keys.add('home')
+        def beginning(event):self.top=0;redraw()
+        @keys.add('s-up')
+        def older_line(event):self.scroll(-3)
+        @keys.add('s-down')
+        def newer_line(event):self.scroll(3)
+        @keys.add('end')
         @keys.add('c-end')
         def end(event): self.top=None;redraw()
-        self.app=Application(layout=Layout(HSplit([self.history_window,self.status_window])),
+        self.app=Application(layout=Layout(HSplit([Window(FormattedTextControl(self.history_label),height=1),self.history_window,self.status_window])),
             key_bindings=keys,full_screen=True,mouse_support=True,
             input=create_input(stdin=sys.stdin),output=create_output(stdout=self.original_out),
             min_redraw_interval=0,refresh_interval=.25)
@@ -52,13 +59,23 @@ class TerminalUI:
         class History(io.TextIOBase):
             def write(self,value):
                 with ui.lock:ui.text+=str(value)
-                ui.app.invalidate();return len(value)
+                if ui.error:ui.original_out.write(str(value));ui.original_out.flush()
+                else:ui.app.invalidate()
+                return len(value)
             def flush(self):pass
             def isatty(self):return True
         self.writer=History()
     def panel_height(self):
         return max(1,min(20,self.app.output.get_size().rows-3,max(10,len(self.dashboard.rows)+7)))
-    def history_height(self):return max(1,self.app.output.get_size().rows-self.panel_height())
+    def history_height(self):return max(1,self.app.output.get_size().rows-self.panel_height()-1)
+    def history_label(self):
+        total=len(self.lines());height=self.history_height()
+        first=max(0,total-height) if self.top is None else self.top
+        mode='LIVE' if self.top is None else 'BROWSING'
+        return '%s history %d–%d / %d · PgUp/PgDn or wheel · Home oldest · End latest' % (mode,first+1 if total else 0,min(total,first+height),total)
+    def check_health(self):
+        if self.error:raise OSError('Terminal UI stopped: '+str(self.error)+'; use --no-live -v for plain output')
+        if hasattr(self,'thread') and not self.thread.is_alive():raise OSError('Terminal UI exited unexpectedly; use --no-live -v for plain output')
     def lines(self):
         width=max(1,self.app.output.get_size().columns)
         with self.lock:text=self.text
@@ -89,13 +106,29 @@ class TerminalUI:
         return '\n'.join(['']*max(0,self.panel_height()-len(lines))+lines)
     def start(self):
         sys.stdout=self.writer;sys.stderr=self.writer
+        def failed(exc):
+            self.error=exc;self.ready.set()
+            self.original_err.write('\nTerminal UI failed: '+str(exc)+'; use --no-live -v for plain output\n')
+            self.original_err.flush()
         def run():
-            try:self.app.run(pre_run=self.ready.set,handle_sigint=False)
-            except Exception as exc:self.error=exc;self.ready.set()
+            def setup():
+                def on_error(loop,context):
+                    exc=context.get('exception') or RuntimeError(context.get('message','UI event loop failed'))
+                    failed(exc)
+                    if self.app.is_running:self.app.exit(exception=exc)
+                self.app.loop.set_exception_handler(on_error)
+            try:self.app.run(pre_run=setup,set_exception_handler=False,handle_sigint=False)
+            except Exception as exc:
+                if not self.error:failed(exc)
+        self.app.after_render+=lambda app:self.ready.set()
         self.thread=threading.Thread(target=run,daemon=True)
-        self.thread.start();self.ready.wait(timeout=2)
+        self.thread.start()
+        if not self.ready.wait(timeout=5):
+            self.error=TimeoutError('no initial screen rendered')
+            self.stop()
+            raise OSError('Terminal UI did not render; use --no-live -v')
         if self.error:
-            sys.stdout=self.original_out;sys.stderr=self.original_err
+            self.stop()
             raise OSError('Terminal UI startup failed: '+str(self.error))
     def stop(self):
         if self.app.is_running:self.app.loop.call_soon_threadsafe(self.app.exit)

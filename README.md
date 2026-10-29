@@ -143,7 +143,7 @@ Each recovery records its time, thread/turn ID, action, normalized error categor
 
 The interactive terminal uses a full-screen layout: independently scrollable event history above a pinned bottom status panel. The panel is capped at **20 terminal lines** and leaves history space on short screens. Each conversation occupies exactly **one row**, including ID/name, model, reasoning depth, Prompt/Goal state, running state, recovery counts and retry timing. Overflowing thread lists are paginated; arrow-key selection keeps the selected page visible.
 
-Use **PageUp/PageDown** or the **mouse wheel over history** to browse older events. New events do not pull you back to the bottom while browsing. **Ctrl+End** returns to the latest events. The status panel remains visible during this in-app scrolling. Native terminal-emulator scrollback is separate; use these controls while the full-screen UI is running. On exit, the event history is printed back into normal terminal scrollback before the summary.
+Use **PageUp/PageDown** or the **mouse wheel over history** to browse older events. New events do not pull you back to the bottom while browsing. **Home** jumps to the oldest history; **End** or **Ctrl+End** returns to the latest events. **Shift+Up/Down** scroll three lines at a time. On Mac keyboards, Fn+Up/Down can provide PageUp/PageDown. A `LIVE`/`BROWSING` header shows the visible line range. The status panel remains visible during this in-app scrolling. Native terminal-emulator scrollback is separate; use these controls while the full-screen UI is running. On exit, the event history is printed back into normal terminal scrollback before the summary.
 
 All fields are rendered on a single wide row. On narrow screens, **Left/Right** pan the status columns horizontally; rows never wrap or turn into multi-line cards. Widen the terminal to see every column at once. Model and reasoning are the daemon's configured settings, not per-token telemetry. Unset reasoning is labelled `default`; unavailable values are marked `?`.
 
@@ -173,7 +173,8 @@ Controls are enabled automatically when standard input and output are interactiv
 | ↑ / ↓ | Select a conversation; its page stays visible |
 | ← / → | Pan status columns on narrow screens |
 | PageUp / PageDown / mouse wheel | Scroll history while the status stays pinned |
-| Ctrl+End | Return to the latest history |
+| Home / End (or Ctrl+End) | Oldest / latest history |
+| Shift+Up / Shift+Down | Scroll history three lines |
 | `?` | Open or close help, including the selected conversation's full ID |
 | `Esc` | Close help |
 | `R` | Request one recovery now for the selected failed thread |
@@ -234,11 +235,14 @@ python codex_multi_recovery.py --socket /path/to/app-server-control.sock -v
 - **Backoff messages without submissions:** the thread is intentionally waiting for its 15-minute retry deadline. The verbose log shows the remaining time.
 - **RPC timeout/disconnection:** the watcher closes an ambiguous transport connection instead of rapidly resending a possibly accepted operation. Restore the daemon connection and restart the watcher while your threads are working. Automatic reconnection is not implemented.
 
+If only the initial monitoring message appears, check that the full-screen UI has opened and use the in-app history keys, rather than the terminal emulator's separate scrollback. UI startup now waits for the first rendered screen, and later UI failures are reported on the real terminal rather than swallowed into a hidden buffer. As a diagnostic fallback, run `python codex_multi_recovery.py --no-live -v`; this keeps ordinary terminal scrollback and prints any connection/polling problem. A monitor without enrolled working threads may otherwise have few event messages; `-v` adds polling details.
+
 Verbose logs can include conversation titles, provider URLs and error messages. Inspect logs before sharing them.
 
 ## Development checks
 
 ```bash
+python -m pip install -r requirements-dev.txt
 python -m unittest discover -s tests -v
 ```
 
