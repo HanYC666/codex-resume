@@ -358,6 +358,10 @@ class Keyboard:
         self.dashboard=dashboard; self.commands=queue.Queue(); self.wake=threading.Event()
         self.done=threading.Event(); self.saved=None; self.thread=None
     def start(self):
+        if getattr(self.dashboard,'terminal',None):
+            self.dashboard.terminal.controls=self
+            self.dashboard.interactive=True
+            return
         if not self.dashboard.enabled or not sys.stdin.isatty(): return
         import termios, tty
         self.fd=sys.stdin.fileno(); self.saved=termios.tcgetattr(self.fd)
@@ -410,6 +414,7 @@ class Dashboard:
         self.enabled=enabled and sys.stdout.isatty() and os.environ.get('TERM')!='dumb'
         self.console=console
         self.live=None
+        self.terminal=None
         self.lock=threading.RLock()
         self.rows={}
         self.selected=None; self.help_open=False; self.interactive=False
@@ -430,21 +435,24 @@ class Dashboard:
 
     def start(self):
         if not self.enabled: return
-        try:
-            from rich.console import Console
-            from rich.live import Live
-        except ImportError:
-            raise RPCError('Missing live-display dependency. Run: python -m pip install -r requirements.txt (or use --no-live)')
+        if sys.stdin.isatty():
+            try: from terminal_ui import TerminalUI
+            except ImportError: raise RPCError('Install dependencies: python -m pip install -r requirements.txt')
+            self.terminal=TerminalUI(self)
+            self.terminal.start()
+            return
+        from rich.console import Console
+        from rich.live import Live
         self.console=self.console or Console(markup=False,highlight=False)
-        self.live=Live(console=self.console, get_renderable=self.render,
-                       refresh_per_second=1, transient=True, screen=False,
-                       vertical_overflow='crop', redirect_stdout=True, redirect_stderr=True)
+        self.live=Live(console=self.console,get_renderable=self.render,refresh_per_second=4,
+                       transient=True,redirect_stdout=True,redirect_stderr=True)
         self.live.start()
 
     def stop(self):
+        if self.terminal:
+            self.terminal.stop();self.terminal=None
         if self.live is not None:
-            self.live.stop()
-            self.live=None
+            self.live.stop();self.live=None
 
     def set_activity(self, value):
         with self.lock: self.activity=plain(value)
@@ -525,156 +533,50 @@ class Dashboard:
         from rich.table import Table
         from rich.text import Text
         with self.lock:
-            rows=list(self.rows.items())
-            selected=self.selected; help_open=self.help_open; interactive=self.interactive
+            rows=list(self.rows.items());selected=self.selected
             errors,attempts,successes,failures=self.errors,self.attempts,self.successes,self.failures
-            activity,last_poll,next_poll=self.activity,self.last_poll,self.next_poll
-            pending,plans=self.pending,self.plans
-        if help_open:
-            return Panel(Text('Selected: '+(selected or 'none')+'\n\n↑ / ↓   Select a thread (full ID below)\nR       Retry once now: Continue or Goal resume\nP       Pause/resume the Codex conversation\nBackspace  Untrack until this watcher exits\n? / Esc    Close help\nQ / Ctrl+C Stop and show summary\n\nR retries failed or paused work. Active tasks are left alone.\nP pauses the Goal and interrupts the turn; resuming starts a new turn.\nR also works during backoff. Backspace only stops tracking.\nDry-run mode never submits recovery commands.'),title='Keyboard help',border_style='cyan')
-        now=time.monotonic()
-        width,height=self.console.size if self.console else (100,24)
-        inner=max(1,width-4)
-        tiny=width<76
-        micro=height<16 or width<32
-        wide=width>=110
-        ids=self.short_ids([tid for tid,_ in rows])
+        width,height=self.console.size if self.console else (100,20)
+        height=min(20,max(3,height));inner=max(1,width-4)
+        def line(text,style=''):
+            return Text(text,style=style,no_wrap=True,overflow='ellipsis')
+        if self.help_open:
+            help=['Keyboard help','↑ / ↓ select conversation · R retry now','P pause/resume actual Codex work','Backspace untrack · ? / Esc close help','PageUp / PageDown / mouse wheel: history · ←/→ pan columns','Ctrl+End: latest history · Q / Ctrl+C exit',
+                  'Selected: '+(selected or 'none'),'P interrupts the turn; resume uses Goal resume or Continue.']
+            return Panel(Group(*(line(x) for x in help[:max(1,height-2)])),border_style='cyan')
         rows.sort(key=lambda item:(self.presentation(item[1])[2],item[1]['title'].casefold(),item[0]))
+        ids=self.short_ids([tid for tid,_ in rows]);capacity=max(1,height-8)
+        pages=max(1,(len(rows)+capacity-1)//capacity)
+        page=int(max(0,time.monotonic()-self.started)//8)%pages
+        if selected in ids:page=next(i for i,(tid,_) in enumerate(rows) if tid==selected)//capacity
         active=sum(r['kind']=='active' and not r['flags'] for _,r in rows)
         ready=sum(self.presentation(r)[0]=='Ready' for _,r in rows)
-        paused=len(rows)-active-ready
-
-        def line(*parts):
-            text=Text.assemble(*parts, no_wrap=True, overflow='ellipsis')
-            return text
-
-        def next_retry(row):
-            if row.get('user_paused'): return 'Paused by you'
-            if row.get('stopped'): return 'Auto off'
-            if row['flags'] or row['kind']=='active' or row['excluded']: return '—'
-            if row['slow'] and row['deadline'] is not None:
-                return duration(row['deadline']-now) if row['deadline']>now else 'Due now'
-            if row['attempted_latest']: return 'Awaiting turn'
-            return 'Next poll' if row['turn']=='failed' else '—'
-
-        def name(tid,row,cells):
-            suffix=' #'+ids[tid]
-            prefix='› ' if tid==selected else '  ' if interactive else ''
-            text=Text(prefix+(row['title'].strip() or 'Untitled'),style='bold cyan' if tid==selected else 'bold')
-            text.truncate(max(1,cells-len(suffix)),overflow='ellipsis')
-            text.append(suffix,style='dim')
-            return text
-
-        def model_depth(row):
-            return (row.get('model') or 'Model ?')+' · '+(row.get('effort') or 'default')
-
-        def mode(row):
-            status=row.get('goal_status')
-            if status=='unknown': return 'Mode ?'
-            if status in (None,'complete'): return 'Prompt'
-            labels={'active':'Goal active','paused':'Goal paused','blocked':'Goal blocked',
-                    'usageLimited':'Goal limited','budgetLimited':'Goal budget'}
-            return labels.get(status,'Goal '+str(status))
-
-        def counts(row):
-            return line((str(row['plans'] if self.dry_run else row['attempts']),'bold'), ' / ',(str(row['successes']),'green'),
-                        ' / ',(str(row['failures']),'red' if row['failures'] else 'dim'))
-
-        header=line(('Active '+str(active),'bold cyan'), '   ',('Paused '+str(paused),'yellow' if paused else 'dim'),
-                    '   ',('Ready '+str(ready),'green' if ready else 'dim'))
-        totals=line(('Sent '+str(attempts),'bold'), '   ',('Done '+str(successes),'green'),
-                    '   ',('Failed '+str(failures),'red' if failures else 'dim'),
-                    '   ',('Pending '+str(pending),'yellow' if pending else 'dim'))
-        border='yellow' if self.dry_run else 'cyan'
-        title=Text('Codex recovery',style='bold')
-        if self.dry_run: title.append(' · DRY RUN',style='yellow')
-        if micro:
-            # Keep at least two terminal lines available for log events.
-            limit=max(1,height-4)
-            compact=[header]
-            if rows:
-                index=next((i for i,(tid,_) in enumerate(rows) if tid==selected),int(max(0,now-self.started)//8)%len(rows))
-                tid,row=rows[index]; label,style,_=self.presentation(row)
-                compact.append(line((label+' ',style),name(tid,row,max(1,inner-len(label)-1))))
-                compact.append(line((model_depth(row),'dim'),' · ',(mode(row),'magenta')))
-                compact.append(line(('15m' if row['slow'] else 'Immediate','yellow' if row['slow'] else 'dim'),
-                                    ' · ',next_retry(row)))
-                compact.append(line((('Plans '+str(row['plans']) if self.dry_run else 'Sent '+str(row['attempts'])),'bold'),' · ',('OK '+str(row['successes']),'green'),
-                                    ' · ',('Fail '+str(row['failures']),'red' if row['failures'] else 'dim')))
-            else: compact.append(line(('Waiting for working threads','dim')))
-            if self.dry_run: compact.append(line(('Simulation · '+str(plans)+' plans; nothing sent','yellow')))
-            return Panel(Group(*compact[:limit]),title=title,border_style=border,padding=(0,1),
-                         subtitle=Text(('%d/%d · rotates 8s · ' % (index+1,len(rows)) if rows else '')+('? help · ' if interactive else '')+'Ctrl+C summary',style='dim'))
-
-        lines=[header]
-        if tiny:
-            lines.extend([line(('Sent '+str(attempts),'bold'),' · ',('Errors '+str(errors),'red' if errors else 'dim')),
-                          line(('Done '+str(successes),'green'),' · ',('Fail '+str(failures),'red' if failures else 'dim'),
-                               ' · ',('Pending '+str(pending),'dim'))])
-        else: lines.extend([totals,Text('')])
-        # Fixed-height, non-wrapping rows make the footer survive short terminals.
-        overhead=(8 if tiny else 9)+(1 if interactive else 0)
-        capacity=max(1,(height-4-overhead)//(4 if tiny else 2))
-        pages=max(1,(len(rows)+capacity-1)//capacity)
-        page=int(max(0,now-self.started)//8)%pages
-        if selected in ids: page=next(i for i,(tid,_) in enumerate(rows) if tid==selected)//capacity
-        shown=rows[page*capacity:(page+1)*capacity]
-        table=Table(expand=True,box=None,padding=(0,1),header_style='dim')
-        table.add_column('THREAD / MODEL · DEPTH',ratio=1,no_wrap=True,overflow='ellipsis')
-        table.add_column('STATE / MODE',width=13,no_wrap=True)
-        if wide:
-            for heading in (('PLANS' if self.dry_run else 'SENT'),'DONE','FAIL','PENDING'):
-                table.add_column(heading,justify='right',no_wrap=True)
-            table.add_column('RETRY',width=9,no_wrap=True)
-            table.add_column('NEXT',width=13,no_wrap=True)
-        else:
-            table.add_column('PLAN/OK/FAIL' if self.dry_run else 'SENT/OK/FAIL',width=12,no_wrap=True)
-            table.add_column('RETRY · NEXT',width=20,no_wrap=True)
-        for tid,row in shown:
-            label,style,_=self.presentation(row)
-            retry_mode='Off' if row.get('stopped') else '15m' if row['slow'] else 'Immediate'
-            timing=next_retry(row)
-            if tiny:
-                label_text=line((label,style))
-                title_text=name(tid,row,max(1,inner-len(label)-3))
-                lines.append(line(title_text,' · ',label_text))
-                lines.append(line((model_depth(row),'dim')))
-                lines.append(line((('Plans '+str(row['plans']) if self.dry_run else 'Sent '+str(row['attempts'])),'bold'),' · ',('OK '+str(row['successes']),'green'),
-                                  ' · ',('Fail '+str(row['failures']),'red' if row['failures'] else 'dim')))
-                lines.append(line((mode(row),'magenta'),' · ',(retry_mode,'yellow' if row['slow'] else 'dim'),' / ',timing))
-            elif wide:
-                title_cell=name(tid,row,max(8,inner-77)); title_cell.append('\n'+model_depth(row),style='dim')
-                state_cell=Text(label,style=style); state_cell.append('\n'+mode(row),style='magenta')
-                table.add_row(title_cell,state_cell,str(row['plans'] if self.dry_run else row['attempts']),
-                              Text(str(row['successes']),style='green'),Text(str(row['failures']),style='red' if row['failures'] else 'dim'),
-                              Text(str(row['unresolved']),style='yellow' if row['unresolved'] else 'dim'),
-                              Text(retry_mode,style='yellow' if row['slow'] else 'dim'),Text(timing,style=style if row['slow'] else 'dim'))
-            else:
-                # The short mode label preserves the countdown at 76–109 columns.
-                retry=line(('Off' if row.get('stopped') else '15m' if row['slow'] else 'Now','yellow' if row['slow'] else 'dim'),' · ',timing)
-                title_cell=name(tid,row,max(8,inner-55)); title_cell.append('\n'+model_depth(row),style='dim')
-                state_cell=Text(label,style=style); state_cell.append('\n'+mode(row),style='magenta')
-                table.add_row(title_cell,state_cell,counts(row),retry)
-        if not rows:
-            lines.append(line(('Waiting for a working thread to appear.','dim')))
-        elif not tiny: lines.append(table)
-        poll=duration(next_poll-now) if next_poll is not None else 'polling'
-        age='—' if last_poll is None else duration(now-last_poll)
-        pager=('Page %d/%d · rotates 8s' % (page+1,pages)) if pages>1 else '%d thread%s' % (len(rows),'' if len(rows)==1 else 's')
-        lines.append(line((('Page %d/%d' % (page+1,pages)) if tiny and pages>1 else pager,'dim'),' · ',('poll %gs / %s' % (self.interval,poll),'dim')))
-        if self.dry_run:
-            lines.append(line(('SIMULATION · %d plans · nothing sent' % plans,'yellow')))
-        else:
-            updated='Updated '+age+' ago' if last_poll is not None else 'Waiting for first poll'
-            detail=updated+' · up '+duration(now-self.started)
-            if not tiny: detail='Errors '+str(errors)+' · '+detail
-            lines.append(line((detail,'dim')))
-        # Activity belongs in the border so it doesn't compete with thread rows.
-        activity=activity.replace('Waiting for next poll','Watching').replace('Polling threads','Polling')
-        if interactive:
-            lines.append(line(((selected or '↑/↓ select a thread')+' · ? help','cyan')))
-        return Panel(Group(*lines),title=title,title_align='left',border_style=border,padding=(0,1),
-                     subtitle=line((activity,'dim'),' · ',('Ctrl+C summary','dim')))
+        header=line('Active %d · Paused %d · Ready %d | Sent %d · Done %d · Failed %d' %
+                    (active,len(rows)-active-ready,ready,attempts,successes,failures),'bold cyan')
+        table=Table(box=None,padding=(0,1),collapse_padding=True,expand=True,header_style='dim')
+        for label,ratio in [('THREAD',2),('MODEL',2),('DEPTH',1),('MODE',1),('STATE',1),('TRY/OK/FAIL',1),('RETRY/NEXT',2)]:
+            fixed={'MODEL':14,'DEPTH':6,'MODE':13,'STATE':12,'TRY/OK/FAIL':11,'RETRY/NEXT':18}
+            table.add_column(label,ratio=ratio if label=='THREAD' or width<110 else None,width=fixed.get(label) if width>=110 else None,no_wrap=True,overflow='ellipsis')
+        now=time.monotonic()
+        for tid,row in rows[page*capacity:(page+1)*capacity]:
+            status,style,_=self.presentation(row)
+            goal=row.get('goal_status')
+            mode='Prompt' if goal in (None,'complete') else 'Mode ?' if goal=='unknown' else 'Goal '+str(goal)
+            retry='15m/'+duration(row['deadline']-now) if row['slow'] and row['deadline'] is not None else 'Now / Next poll' if row['turn']=='failed' else 'Immediate / —'
+            if row['kind']=='active' or row['flags']:retry=('15m' if row['slow'] else 'Immediate')+' / —'
+            elif row.get('attempted_latest') and not row['slow']:retry='Awaiting new turn'
+            if row.get('stopped'):retry='Auto off'
+            if row.get('user_paused'):retry='Paused by you'
+            title=('› ' if tid==selected else '')+'#'+ids[tid]+' '+(row['title'] or 'Untitled')
+            table.add_row(line(title,'bold cyan' if tid==selected else 'bold'),line(row.get('model') or 'Model ?'),
+                line(row.get('effort') or 'default'),line(mode,'magenta'),line(status,style),
+                line('%d/%d/%d'%(row['plans'] if self.dry_run else row['attempts'],row['successes'],row['failures'])),line(retry,'yellow' if row['slow'] else 'dim'))
+        lines=[header,table if rows else line('Waiting for a working thread')]
+        if self.dry_run:lines.append(line('DRY RUN · nothing sent · %d plans'%self.plans,'yellow'))
+        pager='Page %d/%d · rotates 8s'%(page+1,pages) if pages>1 else '%d threads'%len(rows)
+        lines.append(line(pager+' · Errors %d · Poll %gs'%(errors,self.interval),'dim'))
+        lines.append(line((selected or '↑/↓ select')+' · ? help · PgUp/PgDn history','dim'))
+        return Panel(Group(*lines),title='Codex recovery'+(' · DRY RUN' if self.dry_run else ''),
+                     border_style='cyan',subtitle='Ctrl+C summary')
 
 def pages(rpc, method, params):
     cursor=None; seen=set()
@@ -878,7 +780,7 @@ def run(rpc, dry_run, interval, stats=None, dashboard=None):
             if deadlines: delay=min(delay,max(0.1,min(deadlines)-time.monotonic()))
             dashboard.finish_poll(ids,delay,poll_failed)
             log('Poll complete; sleeping %.2fs' % delay)
-            if keyboard.thread: keyboard.wake.wait(delay)
+            if keyboard.thread or dashboard.terminal: keyboard.wake.wait(delay)
             else: time.sleep(delay)
     finally:
         if isinstance(rpc,RPC): rpc.on_activity=None

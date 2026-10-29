@@ -1,3 +1,4 @@
 # Runtime dependencies; Python 3.10+ is required.
 websocket-client==1.9.2
 rich==14.2.0
+prompt-toolkit==3.0.52

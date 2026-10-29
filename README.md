@@ -12,7 +12,7 @@ This repository contains the **free terminal monitor**. A desktop app is planned
 - Python **3.10 or newer**, with `venv` and pip.
 - Git to clone the repository.
 - An installed and configured Codex CLI. The tested version is **0.164.0**; compatibility with other versions is not guaranteed because the app-server protocol can change.
-- The Python package listed in [`requirements.txt`](requirements.txt): `websocket-client` and `rich`.
+- The Python packages listed in [`requirements.txt`](requirements.txt): `websocket-client`, `rich`, and `prompt-toolkit`.
 
 The watcher uses the existing daemon's authentication. Do not put API keys in this repository or pass a key to the watcher. Configure your model provider in Codex itself.
 
@@ -141,24 +141,15 @@ Each recovery records its time, thread/turn ID, action, normalized error categor
 
 ## Live terminal status
 
-An interactive terminal displays a live panel below the scrolling event log. It refreshes once per second, including while the monitor waits between polls or for an RPC response. Events include local timestamps with the date and UTC offset, for example `[2026-10-28 22:37:36+1300]`.
+The interactive terminal uses a full-screen layout: independently scrollable event history above a pinned bottom status panel. The panel is capped at **20 terminal lines** and leaves history space on short screens. Each conversation occupies exactly **one row**, including ID/name, model, reasoning depth, Prompt/Goal state, running state, recovery counts and retry timing. Overflowing thread lists are paginated; arrow-key selection keeps the selected page visible.
 
-The panel shows:
+Use **PageUp/PageDown** or the **mouse wheel over history** to browse older events. New events do not pull you back to the bottom while browsing. **Ctrl+End** returns to the latest events. The status panel remains visible during this in-app scrolling. Native terminal-emulator scrollback is separate; use these controls while the full-screen UI is running. On exit, the event history is printed back into normal terminal scrollback before the summary.
 
-- Active, paused/waiting, ready and tracked thread counts (tracked root threads only).
-- Distinct errors and total recovery attempts, successes and failures.
-- Each thread's state, configured model, reasoning level, Prompt/Goal mode, recovery counts, retry mode and next-retry countdown.
-- Poll interval, next poll, age of the last completed poll, uptime and current RPC activity.
+All fields are rendered on a single wide row. On narrow screens, **Left/Right** pan the status columns horizontally; rows never wrap or turn into multi-line cards. Widen the terminal to see every column at once. Model and reasoning are the daemon's configured settings, not per-token telemetry. Unset reasoning is labelled `default`; unavailable values are marked `?`.
 
-“Immediate” means an eligible new failed turn can be recovered as soon as polling detects it; “15m” means the thread is in slow retry mode. The poll interval remains five seconds by default. “Success” requires an observed completed recovery turn; accepting a command or becoming active does not count. Counts combine Continue and Goal resume for each thread; the exit summary separates them. Dry-run plans are labelled separately and do not inflate real attempt or success counters.
+Keys such as `?` and Up/Down invalidate the screen immediately; they no longer wait for a one-second refresh. Timers refresh four times per second separately from the five-second network polling interval. RPC actions still run through the polling worker and do not cancel an in-flight request.
 
-The panel uses cyan for working threads, green for ready threads and completed recoveries, yellow for backoff or input requests, and red for errors or attention needed. State labels remain visible with colour disabled. `Done` counts completed recovery turns, not completed tasks. `Paused` includes threads waiting for input, in backoff, stopped on an error, or otherwise not working or ready.
-
-Each thread also shows its configured model and reasoning level under its name, and `Prompt`, `Goal active`, `Goal paused`, `Goal blocked`, or a Goal-limit state under its status. These are the daemon's current configured settings, not independent per-token execution telemetry. An unset reasoning level is labelled `default`; unavailable model/mode values are marked `?`. Settings and Goal state refresh on each poll, including after manual changes.
-
-Every row includes a short unique ID suffix, so identical or shortened titles remain distinguishable. Long names, including Unicode names, are shortened by terminal-cell width. Threads needing attention appear first, followed by errors, backoff, working and ready/paused threads. This is display ordering only; it does not change recovery decisions or polling.
-
-Logs appear above the panel, including with `-v`. Wide terminals show separate counters; medium terminals combine them under `SENT/OK/FAIL`. Below 76 columns, thread cards replace the table. Metadata uses additional rows, so page capacity adapts to the available height. Very short terminals use a compact rotating view. When threads do not all fit, pages rotate every eight seconds with a page indicator; totals include every tracked thread, including those on other pages. Dry-run rows display planned operations instead of real submissions, labelled `PLANS` or `PLAN/OK/FAIL`. The panel is removed before the Ctrl+C summary. Output redirected to a file or pipe, and terminals with `TERM=dumb`, automatically use plain timestamped logs without control sequences. To disable the panel explicitly:
+The panel uses labelled colours for states, and dry-run operations remain explicitly simulated. Logs keep local timestamps. For noninteractive output, or to disable the full-screen UI, use:
 
 ```bash
 python codex_multi_recovery.py --no-live -v
@@ -175,11 +166,14 @@ python codex_multi_recovery.py
 
 ## Keyboard controls
 
-Controls are enabled automatically when standard input and output are interactive terminals and the live panel is enabled. No extra dependency is needed on macOS or Linux.
+Controls are enabled automatically when standard input and output are interactive terminals and the live panel is enabled. The terminal interface uses `prompt-toolkit` on macOS and Linux; install the updated requirements.
 
 | Key | Action |
 | --- | --- |
 | ↑ / ↓ | Select a conversation; its page stays visible |
+| ← / → | Pan status columns on narrow screens |
+| PageUp / PageDown / mouse wheel | Scroll history while the status stays pinned |
+| Ctrl+End | Return to the latest history |
 | `?` | Open or close help, including the selected conversation's full ID |
 | `Esc` | Close help |
 | `R` | Request one recovery now for the selected failed thread |

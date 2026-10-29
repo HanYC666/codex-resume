@@ -112,7 +112,7 @@ class FallbackTests(unittest.TestCase):
         dash=m.Dashboard(5,enabled=False);state=m.RecoveryState()
         state.model='gpt-6.1-sol';state.effort='xhigh';state.goal_status='active'
         dash.update_thread('thread','Test',{'type':'active'},[],state,m.RunStats([]))
-        sink=io.StringIO();dash.console=Console(file=sink,width=80,height=24,color_system=None)
+        sink=io.StringIO();dash.console=Console(file=sink,width=150,height=24,color_system=None)
         dash.console.print(dash.render())
         for term in ('gpt-6.1-sol','xhigh','Goal active'):self.assertIn(term,sink.getvalue())
         state.model='gpt-6-sol';state.effort='low';state.goal_status=None
