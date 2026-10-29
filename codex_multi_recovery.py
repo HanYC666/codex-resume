@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Monitor active Codex daemon threads and recover failed turns with per-thread retry backoff."""
-import argparse, json, os, re, socket, sys, threading, time
+import argparse, json, os, re, socket, sys, threading, time, queue
 
 VERBOSE = False
 
@@ -140,6 +140,60 @@ def stop_recovery(rpc, tid, state, goal, reason, dry_run):
         state.goal_status='paused'
 
 
+def pause_conversation(rpc, tid, state, dry_run):
+    """Pause autonomous Goal scheduling before interrupting the current turn."""
+    state.user_paused=True
+    state.pause_error=None
+    try:
+        goal=read_goal(rpc,tid)
+        if goal and goal.get('status')!='complete':
+            if not dry_run: rpc.call('thread/goal/set',{'threadId':tid,'status':'paused','origin':'user'})
+            state.goal_status='paused' if not dry_run else goal.get('status')
+        turns=rpc.call('thread/turns/list',{'threadId':tid,'limit':1,'sortDirection':'desc'}).get('data',[])
+        if turns and turns[0].get('status')=='inProgress':
+            if not dry_run: rpc.call('turn/interrupt',{'threadId':tid,'turnId':turns[0]['id']})
+        event(('DRY RUN: would pause conversation ' if dry_run else 'Conversation paused: ')+tid)
+    except RPCError as exc:
+        state.pause_error=str(exc)
+        event('Pause could not be confirmed for '+tid+': '+str(exc))
+        raise
+
+
+def resume_conversation(rpc, tid, state, stats, dry_run):
+    fresh=rpc.call('thread/read',{'threadId':tid,'includeTurns':False})['thread']
+    status=fresh.get('status') or {}
+    if status.get('type')=='active' or status.get('activeFlags'):
+        state.user_paused=False;state.pause_error=None
+        event('Resume skipped: conversation already active or awaiting input: '+tid)
+        return
+    goal=read_goal(rpc,tid)
+    turns=rpc.call('thread/turns/list',{'threadId':tid,'limit':1,'sortDirection':'desc'}).get('data',[])
+    action='resume goal' if goal and goal.get('status')!='complete' else 'Continue'
+    if action=='Continue' and (not turns or turns[0].get('status') not in ('interrupted','failed')):
+        state.user_paused=False;state.pause_error=None
+        event('No interrupted or failed turn to resume: '+tid)
+        return
+    entry={'time':time.time(),'thread_id':tid,'turn_id':turns[0].get('id') if turns else None,
+           'action':action,'error':None,'slow':state.slow,'manual':True,
+           'outcome':'dry-run' if dry_run else 'pending','result':'dry-run' if dry_run else 'pending'}
+    stats.record(entry)
+    state.record(entry['turn_id'],time.monotonic())
+    try:
+        if not dry_run:
+            if action=='resume goal': rpc.call('thread/goal/set',{'threadId':tid,'status':'active','origin':'user'})
+            else:
+                result=rpc.call('turn/start',{'threadId':tid,'input':[{'type':'text','text':'Continue','text_elements':[]}]})
+                entry['recovery_turn_id']=(result.get('turn') or {}).get('id')
+            entry['outcome']='accepted'
+        state.user_paused=False;state.pause_error=None
+        event(('DRY RUN: ' if dry_run else '')+action+' for paused conversation '+tid)
+    except RPCError as exc:
+        entry['outcome']='rejected' if isinstance(exc,RPCRejected) else 'error-or-unknown'
+        entry['result']='failed' if isinstance(exc,RPCRejected) else 'unknown'
+        state.pause_error=str(exc)
+        raise
+
+
 def fallback_effort(rpc, thread):
     effort=thread.get('reasoningEffort')
     if effort: return effort
@@ -185,6 +239,8 @@ class RecoveryState:
         self.effort = None
         self.goal_status = 'unknown'
         self.stopped = None
+        self.user_paused = False
+        self.pause_error = None
         self.fallback_target = None
         self.fallback_effort = None
         self.fallback_turn = None
@@ -296,6 +352,56 @@ def duration(seconds):
     minutes, seconds=divmod(seconds,60)
     return ('%dh %02dm' % (hours,minutes)) if hours else '%02d:%02d' % (minutes,seconds)
 
+class Keyboard:
+    """POSIX cbreak input; the monitor remains the only RPC writer."""
+    def __init__(self, dashboard):
+        self.dashboard=dashboard; self.commands=queue.Queue(); self.wake=threading.Event()
+        self.done=threading.Event(); self.saved=None; self.thread=None
+    def start(self):
+        if not self.dashboard.enabled or not sys.stdin.isatty(): return
+        import termios, tty
+        self.fd=sys.stdin.fileno(); self.saved=termios.tcgetattr(self.fd)
+        tty.setcbreak(self.fd)
+        self.thread=threading.Thread(target=self.read,daemon=True); self.thread.start()
+        self.dashboard.interactive=True
+    def read(self):
+        import select
+        buffer=b''
+        while not self.done.is_set():
+            if not select.select([self.fd],[],[],.1)[0]:
+                if buffer==b'\x1b':
+                    with self.dashboard.lock: self.dashboard.help_open=False
+                    buffer=b''
+                continue
+            data=os.read(self.fd,128)
+            if not data: return
+            buffer+=data
+            while buffer:
+                if buffer in (b'\x1b',b'\x1b[',b'\x1bO'): break
+                if buffer.startswith((b'\x1b[A',b'\x1bOA')):
+                    self.dashboard.move(-1); buffer=buffer[3:]; continue
+                if buffer.startswith((b'\x1b[B',b'\x1bOB')):
+                    self.dashboard.move(1); buffer=buffer[3:]; continue
+                key=buffer[:1];buffer=buffer[1:]
+                if key==b'?':
+                    with self.dashboard.lock: self.dashboard.help_open=not self.dashboard.help_open
+                elif key==b'\x1b':
+                    with self.dashboard.lock: self.dashboard.help_open=False
+                elif key.lower() in (b'r',b'p') or key in (b'\x7f',b'\x08'):
+                    with self.dashboard.lock: tid=self.dashboard.selected
+                    if tid:
+                        action='untrack' if key in (b'\x7f',b'\x08') else 'retry' if key.lower()==b'r' else 'pause'
+                        self.commands.put((action,tid));self.wake.set()
+                elif key.lower()==b'q': self.commands.put(('quit',None));self.wake.set()
+    def close(self):
+        self.done.set()
+        if self.thread: self.thread.join(timeout=.3)
+        if self.saved is not None:
+            import termios
+            termios.tcsetattr(self.fd,termios.TCSADRAIN,self.saved)
+        self.dashboard.interactive=False
+
+
 class Dashboard:
     """A bottom-of-output live panel; immutable row snapshots cross threads."""
     def __init__(self, interval, dry_run=False, enabled=True, console=None):
@@ -306,6 +412,7 @@ class Dashboard:
         self.live=None
         self.lock=threading.RLock()
         self.rows={}
+        self.selected=None; self.help_open=False; self.interactive=False
         self.errors=self.attempts=self.successes=self.failures=0
         self.pending=self.plans=0
         self.last_poll=None
@@ -313,6 +420,13 @@ class Dashboard:
         self.activity='Starting monitor'
         self.polls=0
         self.started=time.monotonic()
+
+    def move(self, delta):
+        with self.lock:
+            ids=[tid for tid,row in sorted(self.rows.items(),key=lambda item:(self.presentation(item[1])[2],item[1]['title'].casefold(),item[0]))]
+            if not ids: self.selected=None; return
+            index=ids.index(self.selected) if self.selected in ids else (-1 if delta>0 else len(ids))
+            self.selected=ids[max(0,min(len(ids)-1,index+delta))]
 
     def start(self):
         if not self.enabled: return
@@ -356,6 +470,8 @@ class Dashboard:
              'deadline':state.next_retry if state else None,
              'model':state.model if state else None, 'effort':state.effort if state else None,
              'goal_status':state.goal_status if state else 'unknown',
+             'user_paused':bool(state and state.user_paused),
+             'pause_error':state.pause_error if state else None,
              'stopped':state.stopped if state else None,
              'switching':bool(state and state.fallback_target and not state.fallback_confirmed and not state.stopped and not self.dry_run)}
         with self.lock:
@@ -378,6 +494,8 @@ class Dashboard:
     @staticmethod
     def presentation(row):
         """State text, colour and stable display priority; colour is never the only cue."""
+        if row.get('pause_error'): return 'Pause error', 'bold red', 0
+        if row.get('user_paused'): return 'Paused', 'bold yellow', 0
         if row.get('stopped'): return 'Stopped', 'bold red', 0
         if row.get('switching'): return 'Switching', 'bold yellow', 1
         if row['flags']:
@@ -408,9 +526,12 @@ class Dashboard:
         from rich.text import Text
         with self.lock:
             rows=list(self.rows.items())
+            selected=self.selected; help_open=self.help_open; interactive=self.interactive
             errors,attempts,successes,failures=self.errors,self.attempts,self.successes,self.failures
             activity,last_poll,next_poll=self.activity,self.last_poll,self.next_poll
             pending,plans=self.pending,self.plans
+        if help_open:
+            return Panel(Text('Selected: '+(selected or 'none')+'\n\n↑ / ↓   Select a thread (full ID below)\nR       Retry once now: Continue or Goal resume\nP       Pause/resume the Codex conversation\nBackspace  Untrack until this watcher exits\n? / Esc    Close help\nQ / Ctrl+C Stop and show summary\n\nR retries failed or paused work. Active tasks are left alone.\nP pauses the Goal and interrupts the turn; resuming starts a new turn.\nR also works during backoff. Backspace only stops tracking.\nDry-run mode never submits recovery commands.'),title='Keyboard help',border_style='cyan')
         now=time.monotonic()
         width,height=self.console.size if self.console else (100,24)
         inner=max(1,width-4)
@@ -428,6 +549,7 @@ class Dashboard:
             return text
 
         def next_retry(row):
+            if row.get('user_paused'): return 'Paused by you'
             if row.get('stopped'): return 'Auto off'
             if row['flags'] or row['kind']=='active' or row['excluded']: return '—'
             if row['slow'] and row['deadline'] is not None:
@@ -437,7 +559,8 @@ class Dashboard:
 
         def name(tid,row,cells):
             suffix=' #'+ids[tid]
-            text=Text(row['title'].strip() or 'Untitled',style='bold')
+            prefix='› ' if tid==selected else '  ' if interactive else ''
+            text=Text(prefix+(row['title'].strip() or 'Untitled'),style='bold cyan' if tid==selected else 'bold')
             text.truncate(max(1,cells-len(suffix)),overflow='ellipsis')
             text.append(suffix,style='dim')
             return text
@@ -470,7 +593,7 @@ class Dashboard:
             limit=max(1,height-4)
             compact=[header]
             if rows:
-                index=int(max(0,now-self.started)//8)%len(rows)
+                index=next((i for i,(tid,_) in enumerate(rows) if tid==selected),int(max(0,now-self.started)//8)%len(rows))
                 tid,row=rows[index]; label,style,_=self.presentation(row)
                 compact.append(line((label+' ',style),name(tid,row,max(1,inner-len(label)-1))))
                 compact.append(line((model_depth(row),'dim'),' · ',(mode(row),'magenta')))
@@ -481,7 +604,7 @@ class Dashboard:
             else: compact.append(line(('Waiting for working threads','dim')))
             if self.dry_run: compact.append(line(('Simulation · '+str(plans)+' plans; nothing sent','yellow')))
             return Panel(Group(*compact[:limit]),title=title,border_style=border,padding=(0,1),
-                         subtitle=Text(('%d/%d · rotates 8s · ' % (index+1,len(rows)) if rows else '')+'Ctrl+C summary',style='dim'))
+                         subtitle=Text(('%d/%d · rotates 8s · ' % (index+1,len(rows)) if rows else '')+('? help · ' if interactive else '')+'Ctrl+C summary',style='dim'))
 
         lines=[header]
         if tiny:
@@ -490,10 +613,11 @@ class Dashboard:
                                ' · ',('Pending '+str(pending),'dim'))])
         else: lines.extend([totals,Text('')])
         # Fixed-height, non-wrapping rows make the footer survive short terminals.
-        overhead=8 if tiny else 9
+        overhead=(8 if tiny else 9)+(1 if interactive else 0)
         capacity=max(1,(height-4-overhead)//(4 if tiny else 2))
         pages=max(1,(len(rows)+capacity-1)//capacity)
         page=int(max(0,now-self.started)//8)%pages
+        if selected in ids: page=next(i for i,(tid,_) in enumerate(rows) if tid==selected)//capacity
         shown=rows[page*capacity:(page+1)*capacity]
         table=Table(expand=True,box=None,padding=(0,1),header_style='dim')
         table.add_column('THREAD / MODEL · DEPTH',ratio=1,no_wrap=True,overflow='ellipsis')
@@ -547,6 +671,8 @@ class Dashboard:
             lines.append(line((detail,'dim')))
         # Activity belongs in the border so it doesn't compete with thread rows.
         activity=activity.replace('Waiting for next poll','Watching').replace('Polling threads','Polling')
+        if interactive:
+            lines.append(line(((selected or '↑/↓ select a thread')+' · ? help','cyan')))
         return Panel(Group(*lines),title=title,title_align='left',border_style=border,padding=(0,1),
                      subtitle=line((activity,'dim'),' · ',('Ctrl+C summary','dim')))
 
@@ -562,13 +688,34 @@ def pages(rpc, method, params):
 def run(rpc, dry_run, interval, stats=None, dashboard=None):
     stats=stats if stats is not None else RunStats([])
     dashboard=dashboard or Dashboard(interval,dry_run,enabled=False)
+    keyboard=Keyboard(dashboard); suppressed=set(); forced=set()
     tracked={}; states={}; history=stats.history # Process-local, discarded on exit.
     event('Monitoring active root threads from the shared Codex daemon. Ctrl-C to stop.', flush=True)
     try:
         dashboard.start()
+        keyboard.start()
         if isinstance(rpc,RPC): rpc.on_activity=dashboard.set_activity
         while True:
             start=time.monotonic()
+            keyboard.wake.clear()
+            while not keyboard.commands.empty():
+                command,chosen=keyboard.commands.get_nowait()
+                if command=='quit': raise KeyboardInterrupt
+                if chosen not in tracked: continue
+                if command=='untrack':
+                    suppressed.add(chosen);tracked.pop(chosen,None);forced.discard(chosen)
+                    with dashboard.lock:
+                        dashboard.rows.pop(chosen,None)
+                        if dashboard.selected==chosen: dashboard.selected=None
+                    event('Untracked:',chosen)
+                elif command in ('pause','retry'):
+                    st=states[chosen]
+                    try:
+                        if st.user_paused and not st.pause_error:
+                            resume_conversation(rpc,chosen,st,stats,dry_run)
+                        elif command=='pause': pause_conversation(rpc,chosen,st,dry_run)
+                        else: forced.add(chosen)
+                    except RPCError as exc: event('Conversation control failed:',chosen,exc)
             dashboard.begin_poll()
             ids=None
             poll_failed=False
@@ -577,6 +724,8 @@ def run(rpc, dry_run, interval, stats=None, dashboard=None):
                 ids=list(pages(rpc,'thread/loaded/list',{'limit':100}))
                 log('Loaded threads (%d): %s' % (len(ids), ', '.join(ids) or 'none'))
                 for tid in ids:
+                    if tid in suppressed: continue
+                    manual=tid in forced; forced.discard(tid)
                     thread=None; state=None; turns=[]; title=tid; status={}; goal=None
                     try:
                         thread=rpc.call('thread/read',{'threadId':tid,'includeTurns':False})['thread']
@@ -606,9 +755,10 @@ def run(rpc, dry_run, interval, stats=None, dashboard=None):
                         stats.observe(tid,turns)
                         if len(stats.errors)>previous_errors:
                             event('Thread %s: failed turn detected (%s)' % (title,error_identity(turns[0].get('error'))))
-                        if state.stopped:
+                        if state.user_paused and not manual: continue
+                        if state.stopped and not manual:
                             log('Thread %s: automatic recovery disabled: %s' % (tid,state.stopped)); continue
-                        if state.fallback_target and not state.fallback_confirmed and not dry_run:
+                        if state.fallback_target and not state.fallback_confirmed and not dry_run and not manual:
                             if state.model==state.fallback_target and state.effort==state.fallback_effort:
                                 state.fallback_confirmed=True
                                 event('Thread %s: fallback confirmed: %s / %s' % (title,state.model,state.effort))
@@ -637,10 +787,10 @@ def run(rpc, dry_run, interval, stats=None, dashboard=None):
                             log('Thread %s: skipped, missing error or excluded error category' % tid); continue
                         now=time.monotonic()
                         special=configuration_update_error(turn.get('error'))
-                        if special and state.fallback_confirmed and turn_id!=state.fallback_turn:
+                        if not manual and special and state.fallback_confirmed and turn_id!=state.fallback_turn:
                             stop_recovery(rpc,tid,state,goal,'configuration_update error repeated after fallback; no retries',dry_run)
                             continue
-                        if special and not state.fallback_target:
+                        if not manual and special and not state.fallback_target:
                             target=MODEL_FALLBACKS.get(state.model)
                             effort=fallback_effort(rpc,thread) if target else None
                             if not target or not effort:
@@ -665,8 +815,8 @@ def run(rpc, dry_run, interval, stats=None, dashboard=None):
                                 continue
                         if state.failure(turn, now):
                             event('Thread %s: entering 15-minute retry mode (%d consecutive errors; %d matching)' % (title,state.consecutive,state.same_error),flush=True)
-                        switching_recovery=bool(special and state.fallback_confirmed and not state.fallback_recovery_sent)
-                        if not switching_recovery and not state.ready(turn_id, now):
+                        switching_recovery=bool(not manual and special and state.fallback_confirmed and not state.fallback_recovery_sent)
+                        if not manual and not switching_recovery and not state.ready(turn_id, now):
                             if state.slow:
                                 log('Thread %s: backoff; next retry in %.1fs' % (tid,max(0,state.next_retry-now)))
                             else: log('Thread %s: skipped, already attempted this turn' % tid)
@@ -690,7 +840,7 @@ def run(rpc, dry_run, interval, stats=None, dashboard=None):
                         if switching_recovery: state.fallback_recovery_sent=True
                         entry={'time':time.time(),'thread_id':tid,'turn_id':turn_id,
                                'action':action,'error':state.last_error,'slow':state.slow,
-                               'model':state.model,'effort':state.effort,'fallback':switching_recovery,
+                               'model':state.model,'effort':state.effort,'fallback':switching_recovery,'manual':manual,
                                'outcome':'dry-run' if dry_run else 'pending',
                                'result':'dry-run' if dry_run else 'pending'}
                         stats.record(entry)
@@ -728,9 +878,11 @@ def run(rpc, dry_run, interval, stats=None, dashboard=None):
             if deadlines: delay=min(delay,max(0.1,min(deadlines)-time.monotonic()))
             dashboard.finish_poll(ids,delay,poll_failed)
             log('Poll complete; sleeping %.2fs' % delay)
-            time.sleep(delay)
+            if keyboard.thread: keyboard.wake.wait(delay)
+            else: time.sleep(delay)
     finally:
         if isinstance(rpc,RPC): rpc.on_activity=None
+        keyboard.close()
         dashboard.stop()
         stats.print_summary()
 

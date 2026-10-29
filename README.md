@@ -173,6 +173,24 @@ python -m pip install -r requirements.txt
 python codex_multi_recovery.py
 ```
 
+## Keyboard controls
+
+Controls are enabled automatically when standard input and output are interactive terminals and the live panel is enabled. No extra dependency is needed on macOS or Linux.
+
+| Key | Action |
+| --- | --- |
+| ↑ / ↓ | Select a conversation; its page stays visible |
+| `?` | Open or close help, including the selected conversation's full ID |
+| `Esc` | Close help |
+| `R` | Request one recovery now for the selected failed thread |
+| `P` | Pause/resume the actual Codex conversation |
+| Backspace | Untrack the selected conversation until this watcher exits |
+| `Q` or Ctrl+C | Exit and print the summary |
+
+The selected row has a `›` marker, and its full ID appears below the table. `R` chooses Continue or Goal resume from the current Goal state. It bypasses the backoff timer and can explicitly retry a paused or automatically stopped thread once, while leaving an automatic stop in place. Retrying a conversation paused with `P` resumes it and clears that explicit pause. It requires a failed turn, or an interrupted turn paused through `P`, and rechecks before submission; running tasks and input/approval requests are left alone. Commands are handled by the polling worker as soon as its current RPC finishes; a keypress does not cancel an in-flight RPC.
+
+`P` pauses any incomplete Goal first, then interrupts the current running turn through `turn/interrupt`. This stops actual Codex work and suppresses watcher retries for that conversation. Pressing `P` again resumes its Goal, or submits `Continue` for an interrupted/failed prompt. This is a turn interruption, not an operating-system freeze: resuming starts a new turn using the existing conversation history. If you resume the task manually in Codex, the watcher avoids submitting another resume while it is active. Control failures are logged as `Pause error` rather than claiming the task is paused. Backspace also suppresses automatic re-enrollment of that conversation for the rest of this run. History remains available in the exit summary. Dry-run mode continues to simulate all recovery commands. With redirected input/output or `--no-live`, keyboard controls are disabled. Mouse selection is not implemented; use the arrow keys.
+
 ## Ctrl+C run summary
 
 The summary includes distinct errors observed, total commands attempted, and separate `Continue` and `Goal resume` rows:
@@ -231,6 +249,9 @@ python -m unittest discover -s tests -v
 ```
 
 ## Validation and limits
+
+Keyboard controls are covered by a pseudo-terminal test that drives selection, help, pause, retry, untrack and exit, and checks terminal input restoration. A real Codex 0.164.0 server connected to a local waiting endpoint confirmed actual turn interruption, prompt resumption through Continue, Goal pause before interruption, and Goal resumption. These control tests do not require real model inference.
+
 
 A real macOS test with Codex 0.164.0 confirmed Goal resume requests accepted for two threads after 503 and model-not-found failures, followed by both threads becoming active. Local real-server checks also passed WebSocket initialization and thread listing. Simulated tests covered two-thread error handling, deduplication, virtual-clock backoff timing, successful-turn reset, quota eligibility and summary accounting. Display checks cover terminal sizes from 24×8 to 150×32, 40 threads rotating through every page, long Unicode names, colliding ID suffixes, monochrome output, dry-run counters, timestamp sanitizing, and a real pseudo-terminal run with live refresh, interleaved events and Ctrl+C cleanup. The display tests use a simulated daemon; they do not establish new live-provider recovery coverage.
 
