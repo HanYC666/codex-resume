@@ -200,7 +200,9 @@ except KeyboardInterrupt:
                     chunks.append(data)
 
         try:
-            collect(2.2)
+            deadline=time.monotonic()+25
+            while time.monotonic()<deadline and b'15m' not in b''.join(chunks):collect(.1)
+            collect(1.1)
             proc.send_signal(signal.SIGINT)
             collect(2)
             self.assertEqual(proc.wait(timeout=3), 0)

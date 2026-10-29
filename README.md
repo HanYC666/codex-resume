@@ -96,7 +96,7 @@ Leave the watcher running. Ctrl+C stops it and prints the run summary. `deactiva
 
 ## How recovery works
 
-The default poll interval is five seconds. Only root threads observed working during the current run are enrolled; inactive historical conversations and subagents are excluded. The watcher inspects stopped threads in either `idle` or `systemError`, verifies a failed turn, and rechecks the state before submission.
+The default poll interval is one second. Only root threads observed working during the current run are enrolled; inactive historical conversations and subagents are excluded. The watcher inspects stopped threads in either `idle` or `systemError`, verifies a failed turn, and rechecks the state before submission.
 
 | Thread state | Recovery operation |
 | --- | --- |
@@ -112,7 +112,7 @@ Retry state is independent for each thread:
 1. Recover the first eligible failed turn immediately after checks.
 2. After **two consecutive matching errors**, or **three consecutive errors of any type**, enter slow retry mode.
 3. Retry at most once every **15 minutes**, measured from the previous recovery attempt. The same failed turn may be retried when the timer expires.
-4. Stay in slow mode until a completed turn is observed after the failure. Merely returning to `active` does not reset the error streak.
+4. Leave slow mode after a newer completed turn, or when the active thread’s newest turn shows productive activity in its last meaningful item (a non-error assistant message or a successfully completed tool). Merely returning to `active` is not enough. Only the newest turn is fetched with full item detail; older transcript pages are not scanned. Completed-recovery counters remain pending until the turn actually completes.
 
 Repeated polls of the same failed turn do not count as new errors. Error matching normalizes common categories and ignores changing request IDs where recognized. Quota/usage-limit errors are eligible for recovery. The schedule does not query the provider's reset time; another attempt happens within roughly 15 minutes of a cap clearing, provided the watcher and daemon remain available and the turn is still eligible. Polling and RPC latency can add delay.
 
@@ -147,7 +147,7 @@ Use **PageUp/PageDown** or the **mouse wheel over history** to browse older even
 
 All fields are rendered on a single wide row. On narrow screens, **Left/Right** pan the status columns horizontally; rows never wrap or turn into multi-line cards. Widen the terminal to see every column at once. Model and reasoning are the daemon's configured settings, not per-token telemetry. Unset reasoning is labelled `default`; unavailable values are marked `?`.
 
-Keys such as `?` and Up/Down invalidate the screen immediately; they no longer wait for a one-second refresh. Timers refresh four times per second separately from the five-second network polling interval. RPC actions still run through the polling worker and do not cancel an in-flight request.
+Keys such as `?` and Up/Down invalidate the screen immediately; they no longer wait for a one-second refresh. Timers refresh four times per second separately from the one-second default network polling interval. RPC actions still run through the polling worker and do not cancel an in-flight request.
 
 The panel uses labelled colours for states, and dry-run operations remain explicitly simulated. Logs keep local timestamps. For noninteractive output, or to disable the full-screen UI, use:
 
@@ -164,6 +164,14 @@ python -m pip install -r requirements.txt
 python codex_multi_recovery.py
 ```
 
+### Selecting and copying logs
+
+Drag over history to highlight text; releasing the drag copies it. `C` or Ctrl+Y copies the selection again. Ctrl+C copies when a selection exists; press Esc to clear it before using Ctrl+C to exit, or use Q.
+
+On macOS the app uses `pbcopy`; on Linux it tries `wl-copy`, `xclip`, or `xsel`, then OSC52 for supporting terminals. The header reports the copy method. If terminal clipboard access is unsupported, press **F2**: the display freezes and mouse reporting is disabled, allowing normal terminal selection and Cmd+C / terminal Copy. F2 returns to the live view. Monitoring continues while the display is frozen. This also allows copying the status panel. OSC52 delivery does not prove the terminal accepted clipboard access.
+
+The target poll interval is **one second per loaded-thread polling cycle**; slow RPC responses or many threads can make a cycle take longer. This version still uses one polling worker. The `WAIT` counter shows pending/unknown outcomes separately from successful completed turns.
+
 ## Keyboard controls
 
 Controls are enabled automatically when standard input and output are interactive terminals and the live panel is enabled. The terminal interface uses `prompt-toolkit` on macOS and Linux; install the updated requirements.
@@ -176,6 +184,8 @@ Controls are enabled automatically when standard input and output are interactiv
 | Home / End (or Ctrl+End) | Oldest / latest history |
 | Shift+Up / Shift+Down | Scroll history three lines |
 | `?` | Open or close help, including the selected conversation's full ID |
+| F2 | Toggle frozen native selection / live view |
+| C / Ctrl+Y | Copy highlighted history |
 | `Esc` | Close help |
 | `R` | Request one recovery now for the selected failed thread |
 | `P` | Pause/resume the actual Codex conversation |
@@ -213,7 +223,7 @@ python codex_multi_recovery.py --help
 | `--no-live` | Disable the live panel; keep timestamped logs | Off |
 | `--dry-run` | Log planned operations without sending recovery commands | Off |
 | `--check` | Initialize, list loaded thread IDs, and exit without recovery | Off |
-| `--interval SECONDS` | Normal polling interval; must be positive | `5` |
+| `--interval SECONDS` | Normal polling interval; must be positive | `1` |
 | `--timeout SECONDS` | Connection/RPC timeout; must be positive | `30` |
 | `--socket PATH` | Shared daemon's Unix socket | See below |
 | `--url ws://127.0.0.1:PORT` | Connect to an existing local WebSocket endpoint instead of the Unix socket | Unset |

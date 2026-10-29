@@ -29,10 +29,10 @@ class LayoutTests(unittest.TestCase):
   with create_pipe_input() as inp,patch('prompt_toolkit.input.create_input',return_value=inp),patch('prompt_toolkit.output.create_output',return_value=Output()):
    ui=TerminalUI(self.dashboard());ui.text=''.join('event %d\n'%n for n in range(100))
    self.assertLessEqual(ui.panel_height(),20)
-   before=ui.status();self.assertIn('event 99',ui.history()[0][1])
-   ui.scroll(-20);older=ui.history()[0][1]
+   before=ui.status();self.assertIn('event 99',''.join(part[1] for part in ui.history()))
+   ui.scroll(-20);older=''.join(part[1] for part in ui.history())
    self.assertNotIn('event 99',older)
    ui.text+='new event\n'
-   self.assertEqual(ui.history()[0][1],older)
+   self.assertEqual(''.join(part[1] for part in ui.history()),older)
    self.assertEqual(ui.status(),before)
    ui.scroll(1000);self.assertIsNone(ui.top)

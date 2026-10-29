@@ -224,6 +224,35 @@ def error_identity(error):
     message = re.sub(r'(?:request id|request_id|cf-ray)[=: ]+\S+', '', message)
     return re.sub(r'\s+', ' ', message).strip()
 
+def productive_current_turn(turn):
+    """Only the latest meaningful item of the current running turn is evidence."""
+    if turn.get('status')!='inProgress' or turn.get('error'): return False
+    items=turn.get('items') or []
+    for item in reversed(items):
+        kind=item.get('type')
+        if kind in ('userMessage','reasoning','hookPrompt'): continue
+        if item.get('error') or item.get('status') in ('failed','declined'): return False
+        if kind=='agentMessage':
+            text=str(item.get('text') or '').strip()
+            try:
+                value=json.loads(text.lstrip('■ ').strip())
+                if isinstance(value,dict) and 'error' in value:return False
+            except ValueError:pass
+            if any(x in text.lower() for x in ('usage limit reached','stream disconnected before completion','invalid input type')):return False
+            return bool(text)
+        if kind in ('commandExecution','mcpToolCall','dynamicToolCall','fileChange'):
+            return item.get('status')=='completed' and item.get('exitCode') in (None,0) and item.get('success') is not False
+        return False
+    return False
+
+def turn_order(value):
+    # Codex turn IDs are UUIDv7; their first 48 bits are a creation timestamp.
+    import uuid
+    try:
+        parsed=uuid.UUID(str(value))
+        return parsed.int>>80 if parsed.version==7 else None
+    except ValueError:return None
+
 class RecoveryState:
     def __init__(self):
         self.seen_failures = set()
@@ -232,6 +261,7 @@ class RecoveryState:
         self.same_error = 0
         self.last_error = None
         self.last_failed_id = None
+        self.failure_started = None
         self.last_attempt = None
         self.slow = False
         self.next_retry = None
@@ -253,15 +283,17 @@ class RecoveryState:
         ids = [t.get('id') for t in turns]
         if self.last_failed_id in ids:
             newer = turns[:ids.index(self.last_failed_id)]
-        elif turns and turns[0].get('status') == 'completed':
-            newer = turns[:1]
-        else: return False
+        else:
+            anchor=turn_order(self.last_failed_id)
+            newer=[t for t in turns if (anchor is not None and turn_order(t.get('id')) is not None and turn_order(t['id'])>anchor)
+                   or (self.failure_started is not None and t.get('startedAt') is not None and t['startedAt']>self.failure_started)]
         return any(t.get('status') == 'completed' for t in newer)
 
     def reset(self):
         # Keep deduplication history, but a successful turn breaks the error streak.
         self.consecutive = self.same_error = 0
         self.last_error = self.last_failed_id = None
+        self.failure_started = None
         self.slow = False
         self.next_retry = None
 
@@ -274,6 +306,7 @@ class RecoveryState:
         self.same_error = self.same_error + 1 if identity == self.last_error else 1
         self.last_error = identity
         self.last_failed_id = tid
+        self.failure_started = turn.get('startedAt')
         if not self.slow and (self.same_error >= 2 or self.consecutive >= 3):
             self.slow = True
             self.next_retry = (self.last_attempt if self.last_attempt is not None else now) + BACKOFF_SECONDS
@@ -540,8 +573,14 @@ class Dashboard:
         def line(text,style=''):
             return Text(text,style=style,no_wrap=True,overflow='ellipsis')
         if self.help_open:
-            help=['Keyboard help','↑ / ↓ select conversation · R retry now','P pause/resume actual Codex work','Backspace untrack · ? / Esc close help','PageUp / PageDown / mouse wheel: history · ←/→ pan columns','Ctrl+End: latest history · Q / Ctrl+C exit',
-                  'Selected: '+(selected or 'none'),'P interrupts the turn; resume uses Goal resume or Continue.']
+            help=['Keyboard help · Selected: '+(selected or 'none'),
+                  '↑/↓ select · R retry now · P pause/resume Codex',
+                  'Backspace untrack · ?/Esc close help / clear selection',
+                  'Drag to copy · C or Ctrl+Y copy selection',
+                  'F2 native selection: use Cmd+C / terminal Copy',
+                  'PgUp/PgDn/wheel history · ←/→ pan columns',
+                  'Home/End oldest/latest · Q exit',
+                  'Ctrl+C copies selection; otherwise exits']
             return Panel(Group(*(line(x) for x in help[:max(1,height-2)])),border_style='cyan')
         rows.sort(key=lambda item:(self.presentation(item[1])[2],item[1]['title'].casefold(),item[0]))
         ids=self.short_ids([tid for tid,_ in rows]);capacity=max(1,height-8)
@@ -550,11 +589,11 @@ class Dashboard:
         if selected in ids:page=next(i for i,(tid,_) in enumerate(rows) if tid==selected)//capacity
         active=sum(r['kind']=='active' and not r['flags'] for _,r in rows)
         ready=sum(self.presentation(r)[0]=='Ready' for _,r in rows)
-        header=line('Active %d · Paused %d · Ready %d | Sent %d · Done %d · Failed %d' %
-                    (active,len(rows)-active-ready,ready,attempts,successes,failures),'bold cyan')
+        header=line('Active %d · Paused %d · Ready %d | Sent %d · Done %d · Failed %d · Pending %d' %
+                    (active,len(rows)-active-ready,ready,attempts,successes,failures,self.pending),'bold cyan')
         table=Table(box=None,padding=(0,1),collapse_padding=True,expand=True,header_style='dim')
-        for label,ratio in [('THREAD',2),('MODEL',2),('DEPTH',1),('MODE',1),('STATE',1),('TRY/OK/FAIL',1),('RETRY/NEXT',2)]:
-            fixed={'MODEL':14,'DEPTH':6,'MODE':13,'STATE':12,'TRY/OK/FAIL':11,'RETRY/NEXT':18}
+        for label,ratio in [('THREAD',2),('MODEL',2),('DEPTH',1),('MODE',1),('STATE',1),('TRY/OK/FAIL/WAIT',1),('RETRY/NEXT',2)]:
+            fixed={'MODEL':14,'DEPTH':6,'MODE':13,'STATE':12,'TRY/OK/FAIL/WAIT':17,'RETRY/NEXT':18}
             table.add_column(label,ratio=ratio if label=='THREAD' or width<110 else None,width=fixed.get(label) if width>=110 else None,no_wrap=True,overflow='ellipsis')
         now=time.monotonic()
         for tid,row in rows[page*capacity:(page+1)*capacity]:
@@ -569,7 +608,7 @@ class Dashboard:
             title=('› ' if tid==selected else '')+'#'+ids[tid]+' '+(row['title'] or 'Untitled')
             table.add_row(line(title,'bold cyan' if tid==selected else 'bold'),line(row.get('model') or 'Model ?'),
                 line(row.get('effort') or 'default'),line(mode,'magenta'),line(status,style),
-                line('%d/%d/%d'%(row['plans'] if self.dry_run else row['attempts'],row['successes'],row['failures'])),line(retry,'yellow' if row['slow'] else 'dim'))
+                line('%d/%d/%d/%d'%(row['plans'] if self.dry_run else row['attempts'],row['successes'],row['failures'],row['unresolved'])),line(retry,'yellow' if row['slow'] else 'dim'))
         lines=[header,table if rows else line('Waiting for a working thread')]
         if self.dry_run:lines.append(line('DRY RUN · nothing sent · %d plans'%self.plans,'yellow'))
         pager='Page %d/%d · rotates 8s'%(page+1,pages) if pages>1 else '%d threads'%len(rows)
@@ -670,7 +709,14 @@ def run(rpc, dry_run, interval, stats=None, dashboard=None):
                                 if state.fallback_checks>=3:
                                     stop_recovery(rpc,tid,state,goal,'model switch could not be confirmed',dry_run)
                                 continue
-                        if state.completed_since_failure(turns):
+                        progressed=False
+                        if state.slow and kind=='active' and not flags and turns and turns[0].get('id')!=state.last_failed_id and not state.user_paused:
+                            current=rpc.call('thread/turns/list',{'threadId':tid,'limit':1,'sortDirection':'desc','itemsView':'full'}).get('data',[])
+                            progressed=bool(current and current[0].get('id')==turns[0].get('id') and productive_current_turn(current[0]))
+                        if progressed:
+                            state.reset()
+                            event('Thread %s: productive activity in current turn; normal retry rate restored (turn outcome still pending)' % title)
+                        elif state.completed_since_failure(turns):
                             state.reset()
                             event('Thread %s: successful turn observed; normal retry rate restored' % title,flush=True)
                         if kind not in ('idle','systemError') or flags:
@@ -796,7 +842,7 @@ def main():
     p.add_argument('--url',help='optional local ws:// endpoint instead of the Unix socket')
     p.add_argument('--timeout',type=float,default=30,help='connection and RPC timeout in seconds')
     p.add_argument('--check',action='store_true',help='initialize, list loaded thread IDs, and exit without recovery')
-    p.add_argument('--interval',type=float,default=5)
+    p.add_argument('--interval',type=float,default=1)
     p.add_argument('--dry-run',action='store_true')
     p.add_argument('--no-live',action='store_true',help='disable the live panel; retain timestamped event logs')
     p.add_argument('-v','--verbose',action='store_true',help='show detailed polling, decisions, and RPC activity')

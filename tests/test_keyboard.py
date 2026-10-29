@@ -30,7 +30,9 @@ print('COMMANDS',__import__('json').dumps(daemon.commands),flush=True)
      if not data:return
      chunks.append(data)
   try:
-   collect(.8)
+   deadline=time.monotonic()+25
+   while time.monotonic()<deadline and b'Tracking:' not in b''.join(chunks):collect(.1)
+   collect(.5)
    os.write(master,b'\x1b[B');collect(.2)
    os.write(master,b'?');collect(.2)
    self.assertIn('Keyboard help',b''.join(chunks).decode(errors='replace'))
