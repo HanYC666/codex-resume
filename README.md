@@ -170,7 +170,7 @@ Drag over history to highlight text; releasing the drag copies it. `C` or Ctrl+Y
 
 On macOS the app uses `pbcopy`; on Linux it tries `wl-copy`, `xclip`, or `xsel`, then OSC52 for supporting terminals. The header reports the copy method. If terminal clipboard access is unsupported, press **F2**: the display freezes and mouse reporting is disabled, allowing normal terminal selection and Cmd+C / terminal Copy. F2 returns to the live view. Monitoring continues while the display is frozen. This also allows copying the status panel. OSC52 delivery does not prove the terminal accepted clipboard access.
 
-The target poll interval is **one second per loaded-thread polling cycle**; slow RPC responses or many threads can make a cycle take longer. This version still uses one polling worker. The `WAIT` counter shows pending/unknown outcomes separately from successful completed turns.
+The target poll interval is **one second per loaded-thread polling cycle**; slow RPC responses or many threads can make a cycle take longer. This version still uses one polling worker. The `RUN` counter (labelled `Resumed` in the header) shows recovery attempts with confirmed productive work that are still running. `WAIT` / `Pending` only counts attempts awaiting evidence of work or whose outcome is unknown. `OK` / `Done` still requires a completed recovery turn. Current-turn activity is checked on the next poll even outside backoff. Goal recovery retains its observed successor turn ID so completion can be recognised after the original failure leaves the recent history page. In the exit report, unfinished running recoveries remain unresolved because no completed turn has been observed.
 
 ## Keyboard controls
 

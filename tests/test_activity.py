@@ -38,3 +38,64 @@ class PollProgressTests(unittest.TestCase):
    with self.assertRaises(KeyboardInterrupt):m.run(d,False,1,stats,dash)
   self.assertTrue(all(not row['slow'] for row in dash.rows.values()))
   self.assertEqual(len(d.commands),2)
+
+class RecoveryActivityTests(unittest.TestCase):
+ def test_goal_successor_is_retained_after_failure_leaves_page(self):
+  entry={'thread_id':'t','turn_id':'old','action':'resume goal','outcome':'accepted','result':'pending'}
+  stats=m.RunStats([entry])
+  stats.observe('t',[{'id':'new','status':'inProgress'},{'id':'old','status':'failed'}])
+  self.assertEqual(entry['recovery_turn_id'],'new')
+  stats.observe('t',[{'id':'new','status':'inProgress','items':[{'type':'commandExecution','status':'completed','exitCode':0}]}])
+  self.assertTrue(stats.running(entry))
+  self.assertEqual(entry['result'],'pending')
+  stats.observe('t',[{'id':'later','status':'inProgress'},{'id':'new','status':'completed'}])
+  self.assertEqual(entry['result'],'success')
+  self.assertFalse(stats.running(entry))
+
+ def test_error_output_does_not_confirm_resume_or_replace_pinned_turn(self):
+  entry={'thread_id':'t','turn_id':'old','action':'resume goal','outcome':'accepted','result':'pending'}
+  stats=m.RunStats([entry])
+  stats.observe('t',[{'id':'new','status':'inProgress','items':[{'type':'agentMessage','text':'{"error":{"message":"quota"}}'}]}, {'id':'old','status':'failed'}])
+  self.assertFalse(stats.running(entry))
+  stats.observe('t',[{'id':'unrelated','status':'completed'}])
+  self.assertEqual(entry['result'],'pending')
+  stats.observe('t',[{'id':'new','status':'failed'}])
+  self.assertEqual(entry['result'],'failed')
+
+ def test_normal_retry_confirms_work_next_poll_then_completion(self):
+  import contextlib,io
+  from unittest.mock import patch
+  from test_monitor import FakeDaemon
+  class Daemon(FakeDaemon):
+   def call(self,method,params):
+    if method=='thread/read' and self.phase>=2:
+     return {'thread':{'name':params['threadId'],'status':{'type':'active' if self.phase==2 else 'idle'}}}
+    if method=='thread/turns/list' and self.phase>=2:
+     turn={'id':'recovery-1','status':'inProgress' if self.phase==2 else 'completed'}
+     if params.get('itemsView')=='full':
+      turn['items']=[{'type':'commandExecution','status':'completed','exitCode':0}]
+     return {'data':[turn]+([{'id':'initial','status':'failed'}] if self.phase==2 else [])}
+    return super().call(method,params)
+  daemon=Daemon();stats=m.RunStats([]);dash=m.Dashboard(1,enabled=False);snapshots=[]
+  def advance(_):
+   snapshots.append((daemon.phase,dash.pending,dash.resumed,dash.successes))
+   daemon.phase+=1
+   if daemon.phase>3:raise KeyboardInterrupt
+  with patch.object(m.time,'sleep',side_effect=advance),contextlib.redirect_stdout(io.StringIO()):
+   with self.assertRaises(KeyboardInterrupt):m.run(daemon,False,1,stats,dash)
+  self.assertIn((2,0,2,0),snapshots)
+  self.assertIn((3,0,0,2),snapshots)
+  self.assertEqual(len(daemon.commands),2)
+  self.assertTrue(all(not row['slow'] for row in dash.rows.values()))
+
+ def test_recent_work_confirms_resume_when_original_turn_is_missing(self):
+  entry={'thread_id':'t','turn_id':'old','action':'resume goal','outcome':'accepted','result':'pending','time':100}
+  stats=m.RunStats([entry])
+  current={'id':'current','status':'inProgress','startedAt':101,'items':[{'type':'agentMessage','text':'Implementing the next step'}]}
+  stats.observe('t',[dict(current,startedAt=99)])
+  self.assertFalse(stats.running(entry))
+  stats.observe('t',[current])
+  self.assertTrue(stats.running(entry))
+  self.assertNotIn('recovery_turn_id',entry)
+  stats.observe('t',[dict(current,status='completed')])
+  self.assertEqual(entry['result'],'pending')

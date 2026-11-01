@@ -350,12 +350,35 @@ class RunStats:
                 ids=[t.get('id') for t in turns]
                 if entry['turn_id'] in ids:
                     newer=turns[:ids.index(entry['turn_id'])]
-                    if newer: candidate=newer[-1] # first subsequent turn, not an unrelated later success
+                    if newer:
+                        candidate=newer[-1] # first subsequent turn, not an unrelated later success
+                        # Goal resume does not return a turn ID. Retain the first
+                        # observed successor before the failure leaves this page.
+                        entry['recovery_turn_id']=candidate.get('id')
             if candidate:
                 status=candidate.get('status')
                 if status=='completed': entry['result']='success'
                 elif status=='failed': entry['result']='failed'
                 elif status=='interrupted': entry['result']='interrupted'
+                elif productive_current_turn(candidate): entry['working_confirmed']=True
+            # A busy Goal can advance beyond the recent page between polls.
+            # Fresh work confirms resumption, but cannot prove that the missing
+            # recovery turn completed. Never credit an unrelated completion.
+            if entry.get('result')=='pending' and productive_current_turn(latest):
+                anchor=turn_order(entry['turn_id'])
+                current=turn_order(latest.get('id'))
+                newer=(anchor is not None and current is not None and current>anchor)
+                started=latest.get('startedAt')
+                if newer or (started is not None and entry.get('time') is not None and started>=entry['time']):
+                    entry['working_confirmed']=True
+
+    def needs_activity(self, tid):
+        return any(e['thread_id']==tid and e.get('result')=='pending'
+                   and not e.get('working_confirmed') for e in self.history)
+
+    @staticmethod
+    def running(entry):
+        return entry.get('result')=='pending' and bool(entry.get('working_confirmed'))
 
     def record(self, entry):
         # A later retry must not let multiple pending attempts claim one success.
@@ -515,7 +538,7 @@ class Dashboard:
         self.rows={}
         self.selected=None; self.help_open=False; self.interactive=False
         self.errors=self.attempts=self.successes=self.failures=0
-        self.pending=self.plans=0
+        self.pending=self.resumed=self.plans=0
         self.last_poll=None
         self.next_poll=None
         self.activity='Starting monitor'
@@ -568,7 +591,8 @@ class Dashboard:
              'turn':turns[0].get('status') if turns else None,
              'attempts':len(live),'successes':sum(e.get('result')=='success' for e in live),
              'failures':sum(e.get('result')=='failed' for e in live),
-             'unresolved':sum(e.get('result') in ('pending','unknown') for e in live),
+             'unresolved':sum(e.get('result') in ('pending','unknown') and not stats.running(e) for e in live),
+             'resumed':sum(stats.running(e) for e in live),
              'plans':len(entries)-len(live),'slow':bool(state and state.slow),
              'attempted_latest':bool(state and turns and turns[0].get('id') in state.attempted_turns),
              'excluded':bool(turns and turns[0].get('status')=='failed' and blocked_error(turns[0].get('error'))),
@@ -586,7 +610,8 @@ class Dashboard:
             self.attempts=len(sent)
             self.successes=sum(e.get('result')=='success' for e in sent)
             self.failures=sum(e.get('result')=='failed' for e in sent)
-            self.pending=sum(e.get('result') in ('pending','unknown') for e in sent)
+            self.pending=sum(e.get('result') in ('pending','unknown') and not stats.running(e) for e in sent)
+            self.resumed=sum(stats.running(e) for e in sent)
             self.plans=len(stats.history)-len(sent)
 
     def finish_poll(self, loaded, delay, failed=False):
@@ -653,11 +678,11 @@ class Dashboard:
         if selected in ids:page=next(i for i,(tid,_) in enumerate(rows) if tid==selected)//capacity
         active=sum(r['kind']=='active' and not r['flags'] for _,r in rows)
         ready=sum(self.presentation(r)[0]=='Ready' for _,r in rows)
-        header=line('Active %d · Paused %d · Ready %d | Sent %d · Done %d · Failed %d · Pending %d' %
-                    (active,len(rows)-active-ready,ready,attempts,successes,failures,self.pending),'bold cyan')
+        header=line('Active %d · Paused %d · Ready %d | Sent %d · Done %d · Failed %d · Resumed %d · Pending %d' %
+                    (active,len(rows)-active-ready,ready,attempts,successes,failures,self.resumed,self.pending),'bold cyan')
         table=Table(box=None,padding=(0,1),collapse_padding=True,expand=True,header_style='dim')
-        for label,ratio in [('THREAD',2),('MODEL',2),('DEPTH',1),('MODE',1),('STATE',1),('TRY/OK/FAIL/WAIT',1),('RETRY/NEXT',2)]:
-            fixed={'MODEL':14,'DEPTH':6,'MODE':13,'STATE':12,'TRY/OK/FAIL/WAIT':17,'RETRY/NEXT':18}
+        for label,ratio in [('THREAD',2),('MODEL',2),('DEPTH',1),('MODE',1),('STATE',1),('TRY/OK/FAIL/RUN/WAIT',1),('RETRY/NEXT',2)]:
+            fixed={'MODEL':14,'DEPTH':6,'MODE':13,'STATE':12,'TRY/OK/FAIL/RUN/WAIT':21,'RETRY/NEXT':18}
             table.add_column(label,ratio=ratio if label=='THREAD' or width<110 else None,width=fixed.get(label) if width>=110 else None,no_wrap=True,overflow='ellipsis')
         now=time.monotonic()
         for tid,row in rows[page*capacity:(page+1)*capacity]:
@@ -672,7 +697,7 @@ class Dashboard:
             title=('› ' if tid==selected else '')+'#'+ids[tid]+' '+(row['title'] or 'Untitled')
             table.add_row(line(title,'bold cyan' if tid==selected else 'bold'),line(row.get('model') or 'Model ?'),
                 line(row.get('effort') or 'default'),line(mode,'magenta'),line(status,style),
-                line('%d/%d/%d/%d'%(row['plans'] if self.dry_run else row['attempts'],row['successes'],row['failures'],row['unresolved'])),line(retry,'yellow' if row['slow'] else 'dim'))
+                line('%d/%d/%d/%d/%d'%(row['plans'] if self.dry_run else row['attempts'],row['successes'],row['failures'],row['resumed'],row['unresolved'])),line(retry,'yellow' if row['slow'] else 'dim'))
         lines=[header,table if rows else line('Waiting for a working thread')]
         if self.dry_run:lines.append(line('DRY RUN · nothing sent · %d plans'%self.plans,'yellow'))
         pager='Page %d/%d · rotates 8s'%(page+1,pages) if pages>1 else '%d threads'%len(rows)
@@ -774,10 +799,15 @@ def run(rpc, dry_run, interval, stats=None, dashboard=None):
                                     stop_recovery(rpc,tid,state,goal,'model switch could not be confirmed',dry_run)
                                 continue
                         progressed=False
-                        if state.slow and kind=='active' and not flags and turns and turns[0].get('id')!=state.last_failed_id and not state.user_paused:
+                        if (state.slow or stats.needs_activity(tid)) and kind=='active' and not flags and turns and turns[0].get('id')!=state.last_failed_id and not state.user_paused:
                             current=rpc.call('thread/turns/list',{'threadId':tid,'limit':1,'sortDirection':'desc','itemsView':'full'}).get('data',[])
                             progressed=bool(current and current[0].get('id')==turns[0].get('id') and productive_current_turn(current[0]))
-                        if progressed:
+                            if current and current[0].get('id')==turns[0].get('id'):
+                                was_running=any(stats.running(e) for e in history if e['thread_id']==tid)
+                                stats.observe(tid,current)
+                                if not was_running and any(stats.running(e) for e in history if e['thread_id']==tid):
+                                    event('Thread %s: recovery resumed working; awaiting turn completion' % title)
+                        if progressed and state.slow:
                             state.reset()
                             event('Thread %s: productive activity in current turn; normal retry rate restored (turn outcome still pending)' % title)
                         elif state.completed_since_failure(turns):
