@@ -198,12 +198,16 @@ The selected row has a `›` marker, and its full ID appears below the table. `R
 
 ## Ctrl+C run summary
 
-The summary includes distinct errors observed, total commands attempted, and separate `Continue` and `Goal resume` rows:
+The exit report starts with the session duration, start/stop times, monitored conversation count, distinct errors and total recovery attempts. Colour-coded outcomes separate `Continue` from `Goal resume`. A per-conversation breakdown keeps names and unique short IDs, including conversations unloaded or untracked earlier in the run.
+
+Wide terminals use aligned tables; narrow terminals switch to a vertical outcome layout so labels remain readable. Redirected output and `NO_COLOR` work without colour. Empty runs explicitly report that no commands were sent.
+
+Each recovery breakdown includes:
 
 | Column | Meaning |
 | --- | --- |
 | Attempts | Real recovery commands attempted |
-| Successful | A subsequent recovery turn was observed completed |
+| Succeeded | A subsequent recovery turn was observed completed |
 | Failed | The recovery turn failed, or the server explicitly rejected submission |
 | Unresolved | Still running, not observed yet, superseded without a known result, or submission outcome unknown |
 | Interrupted | The recovery turn was observed interrupted |

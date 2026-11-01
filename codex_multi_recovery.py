@@ -329,6 +329,8 @@ class RunStats:
         self.errors = set()
         self.baseline_failures = set()
         self.started = time.monotonic()
+        self.started_at = time.time()
+        self.thread_names = {}
 
     def baseline(self, tid, turn_id, status):
         if status == 'failed': self.baseline_failures.add((tid,turn_id))
@@ -362,22 +364,83 @@ class RunStats:
                 previous["result"]="unknown"
         self.history.append(entry)
 
-    def print_summary(self):
-        print('\nRun summary (%.0f seconds)' % (time.monotonic()-self.started),flush=True)
-        print('Distinct errors observed: %d (failed turns; repeated polls count once)' % len(self.errors),flush=True)
-        live_total=sum(e['outcome']!='dry-run' for e in self.history)
-        print('Recovery commands attempted: %d' % live_total,flush=True)
-        print('%-17s %8s %10s %8s %10s %11s %8s' % ('Recovery','Attempts','Successful','Failed','Unresolved','Interrupted','Dry-run'),flush=True)
-        for action,label in (('Continue','Continue'),('resume goal','Goal resume')):
-            entries=[e for e in self.history if e['action']==action]
-            live=[e for e in entries if e['outcome']!='dry-run']
-            counts=[len(live),sum(e.get('result')=='success' for e in live),
-                    sum(e.get('result')=='failed' for e in live),
-                    sum(e.get('result') in ('pending','unknown') for e in live),
-                    sum(e.get('result')=='interrupted' for e in live),len(entries)-len(live)]
-            print('%-17s %8d %10d %8d %10d %11d %8d' % (label,*counts),flush=True)
-        print('Successful = observed a completed recovery turn; failed = next turn failed or submission rejected.',flush=True)
-        print('Unresolved = still running, not yet observed, or submission outcome unknown. Dry-run does not send commands.',flush=True)
+    @staticmethod
+    def counts(entries):
+        live=[e for e in entries if e['outcome']!='dry-run']
+        return (len(live),sum(e.get('result')=='success' for e in live),
+                sum(e.get('result')=='failed' for e in live),
+                sum(e.get('result') in ('pending','unknown',None) for e in live),
+                sum(e.get('result')=='interrupted' for e in live),len(entries)-len(live))
+
+    def print_summary(self, console=None):
+        """Static exit report, printed after the live screen is restored."""
+        from rich.console import Console, Group
+        from rich.panel import Panel
+        from rich.table import Table
+        from rich.text import Text
+        console=console or Console(markup=False,highlight=False)
+        compact=console.width<80
+        elapsed=max(0,int(time.monotonic()-self.started))
+        hours,remainder=divmod(elapsed,3600)
+        minutes,seconds=divmod(remainder,60)
+        runtime=(f'{hours}h {minutes:02d}m {seconds:02d}s' if hours else f'{minutes}m {seconds:02d}s')
+        ids=set(self.thread_names) | {e['thread_id'] for e in self.history} | {tid for tid,_ in self.errors}
+        totals=self.counts(self.history)
+        header=Text('Codex Resume',style='bold cyan')
+        header.append(f'  ·  {runtime}',style='bold')
+        started=time.strftime('%Y-%m-%d %H:%M:%S %Z',time.localtime(self.started_at))
+        header.append(f'\nStarted  {started}\nStopped  '+time.strftime('%Y-%m-%d %H:%M:%S %Z'),style='dim')
+        metrics=Table.grid(padding=(0,2))
+        metrics.add_column(style='bold'); metrics.add_column(justify='right')
+        for label,value,style in (('Threads monitored',len(ids),''),('Distinct errors',len(self.errors),''),
+                                  ('Recovery attempts',totals[0],''),('Succeeded',totals[1],'green'),
+                                  ('Failed',totals[2],'red'),('Unresolved',totals[3],'yellow')):
+            metrics.add_row(Text(label,style=style),Text(str(value),style=style))
+        console.print()
+        console.print(Panel(Group(header,Text(''),metrics),title='Run summary',
+                            title_align='left',border_style='cyan',padding=(1,2)))
+        labels=('Attempts','Succeeded','Failed','Unresolved','Interrupted','Dry-run')
+        styles=('', 'green', 'red', 'yellow', 'magenta', 'dim')
+        def breakdown(rows):
+            table=Table(box=None,padding=(0,1))
+            if compact:
+                # Transpose instead of truncating outcome labels on narrow screens.
+                table.add_column('Outcome',style='dim')
+                for name,_ in rows: table.add_column(name,justify='right')
+                for i,(label,style) in enumerate(zip(labels,styles)):
+                    table.add_row(Text(label,style=style),*(str(values[i]) for _,values in rows))
+            else:
+                table.add_column('Recovery',style='bold')
+                for label,style in zip(labels,styles):
+                    table.add_column(label,justify='right',style=style)
+                for name,values in rows: table.add_row(name,*(str(v) for v in values))
+            console.print(table)
+            console.print()
+        actions=(('Continue','Continue'),('resume goal','Goal resume'))
+        console.print(Text('Recovery outcomes',style='bold'))
+        breakdown([(label,self.counts([e for e in self.history if e['action']==action]))
+                   for action,label in actions])
+        if not totals[0]:
+            console.print(Text('No recovery commands were sent during this run.\n',style='dim'))
+        if ids:
+            console.print(Text('By conversation',style='bold'))
+            short_ids=Dashboard.short_ids(ids)
+            for tid in sorted(ids,key=lambda key:(self.thread_names.get(key,key).casefold(),key)):
+                console.print(Text(plain(self.thread_names.get(tid,tid)),style='bold'))
+                errors=sum(key[0]==tid for key in self.errors)
+                console.print(Text(f'#{plain(short_ids[tid])}  ·  {errors} distinct errors',style='dim'))
+                entries=[e for e in self.history if e['thread_id']==tid]
+                rows=[(label,self.counts([e for e in entries if e['action']==action]))
+                      for action,label in actions if any(e['action']==action for e in entries)]
+                if rows: breakdown(rows)
+                else: console.print(Text('No recovery attempts.\n',style='dim'))
+        notes=Text('Succeeded',style='green')
+        notes.append(' means a recovery turn completed, not that the entire task finished.\n')
+        notes.append('Unresolved',style='yellow')
+        notes.append(' means still running or the outcome could not be confirmed.\n')
+        notes.append('Interrupted turns are separate from failures. Dry-run plans send no commands.\n')
+        notes.append('Errors count distinct failed turns observed this run, excluding baseline failures.',style='dim')
+        console.print(notes)
 
 def duration(seconds):
     seconds=max(0,int(seconds))
@@ -497,6 +560,7 @@ class Dashboard:
             self.next_poll=None
 
     def update_thread(self, tid, title, status, turns, state, stats):
+        stats.thread_names[tid]=plain(title)
         entries=[e for e in stats.history if e['thread_id']==tid]
         live=[e for e in entries if e['outcome']!='dry-run']
         row={'title':plain(title), 'kind':status.get('type'),
