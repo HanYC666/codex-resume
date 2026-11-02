@@ -107,6 +107,7 @@ def blocked_error(error):
     return any(x in s for x in ('cybersecurity','safety check','approval required','permission denied'))
 
 BACKOFF_SECONDS = 15 * 60
+RESTORE_SECONDS = 15
 
 MODEL_FALLBACKS = {'gpt-6.1-sol':'gpt-6-sol', 'gpt-6-astra':'gpt-6-sol'}
 
@@ -277,6 +278,8 @@ class RecoveryState:
         self.fallback_confirmed = False
         self.fallback_checks = 0
         self.fallback_recovery_sent = False
+        self.unavailable = False
+        self.restore_after = 0
 
     def completed_since_failure(self, turns):
         if not self.last_failed_id: return False
@@ -601,6 +604,8 @@ class Dashboard:
              'goal_status':state.goal_status if state else 'unknown',
              'user_paused':bool(state and state.user_paused),
              'pause_error':state.pause_error if state else None,
+             'unavailable':bool(state and state.unavailable),
+             'restore_after':state.restore_after if state else None,
              'stopped':state.stopped if state else None,
              'switching':bool(state and state.fallback_target and not state.fallback_confirmed and not state.stopped and not self.dry_run)}
         with self.lock:
@@ -621,12 +626,19 @@ class Dashboard:
             self.next_poll=time.monotonic()+delay
             self.activity='Poll failed; waiting to retry' if failed else 'Waiting for next poll'
 
+    def mark_unavailable(self, tid, state):
+        with self.lock:
+            if tid in self.rows:
+                self.rows[tid].update(kind='notLoaded',unavailable=True,
+                                      restore_after=state.restore_after)
+
     @staticmethod
     def presentation(row):
         """State text, colour and stable display priority; colour is never the only cue."""
         if row.get('pause_error'): return 'Pause error', 'bold red', 0
         if row.get('user_paused'): return 'Paused', 'bold yellow', 0
         if row.get('stopped'): return 'Stopped', 'bold red', 0
+        if row.get('unavailable'): return 'Reconnecting', 'yellow', 1
         if row.get('switching'): return 'Switching', 'bold yellow', 1
         if row['flags']:
             label='Approval' if 'waitingOnApproval' in row['flags'] else 'Needs input'
@@ -694,6 +706,8 @@ class Dashboard:
             elif row.get('attempted_latest') and not row['slow']:retry='Awaiting new turn'
             if row.get('stopped'):retry='Auto off'
             if row.get('user_paused'):retry='Paused by you'
+            if row.get('unavailable') and not row.get('user_paused') and not row.get('stopped'):
+                retry='Restore/'+duration((row.get('restore_after') or now)-now)
             title=('› ' if tid==selected else '')+'#'+ids[tid]+' '+(row['title'] or 'Untitled')
             table.add_row(line(title,'bold cyan' if tid==selected else 'bold'),line(row.get('model') or 'Model ?'),
                 line(row.get('effort') or 'default'),line(mode,'magenta'),line(status,style),
@@ -742,6 +756,9 @@ def run(rpc, dry_run, interval, stats=None, dashboard=None):
                 elif command in ('pause','retry'):
                     st=states[chosen]
                     try:
+                        if st.unavailable and not dry_run:
+                            rpc.call('thread/resume',{'threadId':chosen,'excludeTurns':True})
+                            st.unavailable=False;st.restore_after=0
                         if st.user_paused and not st.pause_error:
                             resume_conversation(rpc,chosen,st,stats,dry_run)
                         elif command=='pause': pause_conversation(rpc,chosen,st,dry_run)
@@ -754,17 +771,42 @@ def run(rpc, dry_run, interval, stats=None, dashboard=None):
             try:
                 ids=list(pages(rpc,'thread/loaded/list',{'limit':100}))
                 log('Loaded threads (%d): %s' % (len(ids), ', '.join(ids) or 'none'))
-                for tid in ids:
+                # Loaded is a daemon residency list, not the watcher's enrollment
+                # list. Unloading must not forget baselines or retry deadlines.
+                for tid in dict.fromkeys(ids+sorted(tracked)):
                     if tid in suppressed: continue
                     manual=tid in forced; forced.discard(tid)
                     thread=None; state=None; turns=[]; title=tid; status={}; goal=None
                     try:
+                        state=states.get(tid)
+                        if (state and state.unavailable and tid not in ids and not manual
+                                and time.monotonic()<state.restore_after): continue
                         thread=rpc.call('thread/read',{'threadId':tid,'includeTurns':False})['thread']
                         if thread.get('parentThreadId'):
                             log('Thread %s: skipped subagent, parent=%s' % (tid, thread['parentThreadId']))
                             continue
                         status=thread.get('status') or {}; kind=status.get('type'); flags=status.get('activeFlags') or []
                         title=thread.get('name') or thread.get('preview') or tid
+                        if tid in tracked and (tid not in ids or kind=='notLoaded'):
+                            state=states[tid]
+                            if not state.unavailable:
+                                event('Thread %s: no longer listed as loaded; keeping tracking and retry schedule' % title)
+                            if kind!='active':
+                                state.unavailable=True
+                                state.restore_after=time.monotonic()+RESTORE_SECONDS
+                                if state.user_paused or state.stopped or dry_run:
+                                    continue
+                                # Restore only the session, without user input,
+                                # a Goal status change, or settings overrides.
+                                rpc.call('thread/resume',{'threadId':tid,'excludeTurns':True})
+                                thread=rpc.call('thread/read',{'threadId':tid,'includeTurns':False})['thread']
+                                status=thread.get('status') or {};kind=status.get('type');flags=status.get('activeFlags') or []
+                                if kind not in ('active','idle','systemError'):
+                                    raise RPCError('restored session is not loaded yet')
+                                event('Thread %s: daemon session restored; tracking retained' % title)
+                        if state and state.unavailable:
+                            state.unavailable=False;state.restore_after=0
+                            event('Thread %s: monitoring available again' % title)
                         log('Thread %s: status=%s flags=%s tracked=%s' % (tid, kind, flags, tid in tracked))
                         if kind=='active' and not flags:
                             if tid not in tracked: event('Tracking:',title,tid,flush=True)
@@ -906,12 +948,17 @@ def run(rpc, dry_run, interval, stats=None, dashboard=None):
                                 entry['result']='unknown'
                                 raise
                             log('Thread %s: recovery request accepted' % tid)
-                    except RPCError as e: event('Thread',tid,'skipped:',e,flush=True)
+                    except RPCError as e:
+                        if tid in tracked:
+                            state=states[tid]
+                            state.unavailable=True
+                            state.restore_after=time.monotonic()+RESTORE_SECONDS
+                            event('Thread',tid,'temporarily unavailable; tracking retained:',e,flush=True)
+                        else: event('Thread',tid,'skipped:',e,flush=True)
                     finally:
                         if thread is not None and tid in tracked:
                             dashboard.update_thread(tid,title,status,turns,state,stats)
-                for missing in set(tracked)-set(ids): log('Thread %s: no longer loaded; removing from tracking' % missing)
-                tracked={k:v for k,v in tracked.items() if k in ids}
+                        if state and state.unavailable: dashboard.mark_unavailable(tid,state)
             except RPCError as e:
                 poll_failed=True
                 event('Polling failed:',e,flush=True)
@@ -919,7 +966,7 @@ def run(rpc, dry_run, interval, stats=None, dashboard=None):
             delay=max(0.1,interval-(time.monotonic()-start))
             deadlines=[st.next_retry for st in states.values() if st.slow and st.next_retry is not None and st.next_retry > time.monotonic()]
             if deadlines: delay=min(delay,max(0.1,min(deadlines)-time.monotonic()))
-            dashboard.finish_poll(ids,delay,poll_failed)
+            dashboard.finish_poll(set(tracked),delay,poll_failed)
             log('Poll complete; sleeping %.2fs' % delay)
             if keyboard.thread or dashboard.terminal: keyboard.wake.wait(delay)
             else: time.sleep(delay)

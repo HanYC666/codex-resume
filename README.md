@@ -137,6 +137,8 @@ The panel shows `Stopped` and disables its retry countdown. Events explain why t
 
 ### Recovery history
 
+Once enrolled, a conversation stays tracked until you explicitly untrack it or exit the watcher. The daemon's loaded-thread list is used to discover new work, not to remove enrolled conversations. If Codex unloads a tracked session, the watcher retains its baseline, counters, pause/stop state and retry deadline, and restores the session through `thread/resume` without sending a prompt or changing its settings. Ordinary recovery still rechecks the latest status and obeys the existing 15-minute deadline. A temporarily unavailable session remains visible as **Reconnecting**; failed restoration is retried after 15 seconds. A session paused with `P` or stopped by fallback protection is not automatically restored or resumed. Dry-run never restores sessions.
+
 Each recovery records its time, thread/turn ID, action, normalized error category, retry mode and outcome **in memory only**. Nothing is saved to a history file. History and counters are discarded when the program exits. With `-v`, recovery records and backoff countdowns are printed to the terminal.
 
 ## Live terminal status
@@ -276,3 +278,7 @@ The sandbox's earlier `thread/start` hang was isolated to project-instruction di
 This Linux live test covers Continue recovery over localhost WebSocket; it does not establish Linux Unix-socket or Goal-resume coverage. The 15-minute policy has not been tested through a live five-hour quota reset. Treat compatibility with future Codex releases as unverified.
 
 Threads that start and fail between polls can be missed. Summary outcomes reflect observed turns rather than proof that an entire Goal or task finished. Restarting clears all memory and retry timers; it does not automatically enroll already-failed threads. Ctrl+C prints a summary; forced termination may prevent one from being printed.
+
+A local real-server check on 2026-11-02 used Codex 0.166.0-alpha.1 with one prompt and one Goal. Each received six identical injected `compaction_upstream_unavailable` errors. After both sessions were recreated in the test server, the watcher restored both, retained enrollment and counters, and continued automatic retries (ten recovery commands in total). The test shortened backoff to two seconds; simulated-clock tests independently verify the full 900-second deadline, temporary restoration failures, and both conversations disappearing together. These are controlled local-provider tests, not a live upstream API test.
+
+A second local real-server check injected the exact configuration-update error for `gpt-6.1-sol / high` and `gpt-6-astra / max`. Both switched to `gpt-6-sol` at the same depth; the repeated error stopped recovery and paused the Goal. Four requests total were observed, with no additional requests after stopping.
