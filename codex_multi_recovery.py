@@ -673,15 +673,24 @@ class Dashboard:
         def line(text,style=''):
             return Text(text,style=style,no_wrap=True,overflow='ellipsis')
         if self.help_open:
-            help=['Keyboard help · Selected: '+(selected or 'none'),
-                  '↑/↓ select · R retry now · P pause/resume Codex',
-                  'Backspace untrack · ?/Esc close help / clear selection',
-                  'Drag to copy · C or Ctrl+Y copy selection',
-                  'F2 native selection: use Cmd+C / terminal Copy',
-                  'PgUp/PgDn/wheel history · ←/→ pan columns',
-                  'Home/End oldest/latest · Q exit',
-                  'Ctrl+C copies selection; otherwise exits']
-            return Panel(Group(*(line(x) for x in help[:max(1,height-2)])),border_style='cyan')
+            def help_row(*bindings):
+                row=Text(no_wrap=True,overflow='ellipsis')
+                for index,(keys,action) in enumerate(bindings):
+                    if index:
+                        row.append(' '*max(1,38-row.cell_len))
+                        row.append('│  ',style='dim')
+                    row.append(keys,style='bold cyan')
+                    row.append(' - '+action)
+                return row
+            help=[line('Keyboard help · Selected: '+(selected or 'none'),'bold'),
+                  help_row(('↑/↓','Select thread'),('←/→','Pan columns')),
+                  help_row(('R','Retry now'),('P','Pause/resume')),
+                  help_row(('Backspace','Untrack'),('Q','Exit')),
+                  help_row(('PgUp/PgDn/wheel','Scroll'),('Home/End','Oldest/latest')),
+                  help_row(('Drag','Select and copy'),('C/Ctrl+Y','Copy again')),
+                  help_row(('F2','Native selection'),('?/Esc','Close help')),
+                  help_row(('Ctrl+C','Copy selection or exit'))]
+            return Panel(Group(*help[:max(1,height-2)]),border_style='cyan')
         rows.sort(key=lambda item:(self.presentation(item[1])[2],item[1]['title'].casefold(),item[0]))
         ids=self.short_ids([tid for tid,_ in rows]);capacity=max(1,height-8)
         pages=max(1,(len(rows)+capacity-1)//capacity)

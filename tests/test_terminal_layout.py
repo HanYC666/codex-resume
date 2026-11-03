@@ -1,4 +1,4 @@
-import io,unittest
+import io,re,unittest
 from unittest.mock import patch
 from rich.console import Console
 from prompt_toolkit.input import create_pipe_input
@@ -40,6 +40,18 @@ class LayoutTests(unittest.TestCase):
      frame=ui.status()
      for name in names:self.assertIn(name,frame)
      self.assertIn('5 threads',frame)
+ def test_help_highlights_keys_and_fits_short_panel(self):
+  d=m.Dashboard(5,enabled=False);d.help_open=True
+  sink=io.StringIO();d.console=Console(file=sink,width=100,height=10,force_terminal=True,color_system='standard')
+  d.console.print(d.render());help_text=sink.getvalue()
+  self.assertEqual(len(help_text.splitlines()),10)
+  for key,action in (('R','Retry now'),('P','Pause/resume'),
+                     ('Backspace','Untrack'),('Ctrl+C','Copy selection or exit')):
+   self.assertRegex(help_text,r'\x1b\[1(?:;\d+)*m'+re.escape(key)+r'\x1b\[0m - '+re.escape(action))
+  plain=re.sub(r'\x1b\[[0-9;]*m','',help_text)
+  aligned=[row.index('│',2) for row in plain.splitlines() if ' - ' in row and row.count('│')==3]
+  self.assertEqual(len(aligned),6)
+  self.assertEqual(len(set(aligned)),1)
  def test_history_scroll_preserves_fixed_status_and_read_position(self):
   with create_pipe_input() as inp,patch('prompt_toolkit.input.create_input',return_value=inp),patch('prompt_toolkit.output.create_output',return_value=Output()):
    ui=TerminalUI(self.dashboard());ui.text=''.join('event %d\n'%n for n in range(100))
