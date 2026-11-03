@@ -1,2 +1,5 @@
 # macOS Finder metadata (all directories)
 .DS_Store
+
+# Python bytecode cache directories
+__pycache__/
