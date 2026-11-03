@@ -3,3 +3,8 @@
 
 # Python bytecode cache directories
 __pycache__/
+*.py[cod]
+
+# Local Python virtual environments
+.venv/
+venv/
