@@ -619,9 +619,8 @@ class Dashboard:
             self.resumed=sum(stats.running(e) for e in sent)
             self.plans=len(stats.history)-len(sent)
 
-    def finish_poll(self, loaded, delay, failed=False):
+    def finish_poll(self, delay, failed=False):
         with self.lock:
-            if loaded is not None: self.rows={k:v for k,v in self.rows.items() if k in loaded}
             if not failed: self.last_poll=time.monotonic()
             self.next_poll=time.monotonic()+delay
             self.activity='Poll failed; waiting to retry' if failed else 'Waiting for next poll'
@@ -966,7 +965,7 @@ def run(rpc, dry_run, interval, stats=None, dashboard=None):
             delay=max(0.1,interval-(time.monotonic()-start))
             deadlines=[st.next_retry for st in states.values() if st.slow and st.next_retry is not None and st.next_retry > time.monotonic()]
             if deadlines: delay=min(delay,max(0.1,min(deadlines)-time.monotonic()))
-            dashboard.finish_poll(set(tracked),delay,poll_failed)
+            dashboard.finish_poll(delay,poll_failed)
             log('Poll complete; sleeping %.2fs' % delay)
             if keyboard.thread or dashboard.terminal: keyboard.wake.wait(delay)
             else: time.sleep(delay)

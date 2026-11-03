@@ -25,6 +25,21 @@ class LayoutTests(unittest.TestCase):
   self.assertGreater(len(data),1)
   for row in data:
    for field in ('gpt-6-sol','high','Goal active','Working'):self.assertIn(field,row)
+ def test_five_tracked_threads_stay_visible_when_states_change(self):
+  d=m.Dashboard(5,enabled=False)
+  names=('smallS','print panda website','Sleep Disabler','fourth thread','fifth thread')
+  for name in names:
+   d.update_thread(name,name,{'type':'active'},[],m.RecoveryState(),m.RunStats([]))
+  with create_pipe_input() as inp,patch('prompt_toolkit.input.create_input',return_value=inp),patch('prompt_toolkit.output.create_output',return_value=Output()):
+   ui=TerminalUI(d)
+   with patch.object(ui.app.output,'get_size',return_value=Size(rows=16,columns=150)):
+    self.assertEqual(ui.panel_height(),13)
+    for status in ({'type':'active'},{'type':'systemError'}):
+     d.update_thread('smallS','smallS',status,[],m.RecoveryState(),m.RunStats([]))
+     d.finish_poll(1)
+     frame=ui.status()
+     for name in names:self.assertIn(name,frame)
+     self.assertIn('5 threads',frame)
  def test_history_scroll_preserves_fixed_status_and_read_position(self):
   with create_pipe_input() as inp,patch('prompt_toolkit.input.create_input',return_value=inp),patch('prompt_toolkit.output.create_output',return_value=Output()):
    ui=TerminalUI(self.dashboard());ui.text=''.join('event %d\n'%n for n in range(100))

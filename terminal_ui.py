@@ -95,7 +95,7 @@ class TerminalUI:
             def isatty(self):return True
         self.writer=History()
     def panel_height(self):
-        return max(1,min(20,self.app.output.get_size().rows-3,max(10,len(self.dashboard.rows)+7)))
+        return max(1,min(20,self.app.output.get_size().rows-3,max(10,len(self.dashboard.rows)+8)))
     def history_height(self):return max(1,self.app.output.get_size().rows-self.panel_height()-1)
     def history_label(self):
         if not self.mouse_enabled:return 'NATIVE SELECTION · drag and use Cmd+C / terminal Copy · F2 returns to live UI'
